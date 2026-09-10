@@ -9,6 +9,7 @@ const { filterRepoFiles } = require("../services/repoFilter");
 const { parseFile, getLanguage } = require("../services/codeParser");
 const { analyzeFile } = require("../services/complexity");
 const { lintContent } = require("../services/lintService");
+const { buildDependencyGraph } = require("../services/dependencyGraph");
 
 const router = express.Router();
 
@@ -356,6 +357,29 @@ router.get("/:id/analysis", async (req, res, next) => {
       summary,
       files: analysisDocs.map(serializeAnalysisFile),
     });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// Dependency graph derived from FileAnalysis imports (internal + external).
+router.get("/:id/graph", async (req, res, next) => {
+  try {
+    if (!mongoose.isValidObjectId(req.params.id)) {
+      return res.status(404).json({ error: "Repository not found" });
+    }
+    const repoDoc = await Repository.findOne({ _id: req.params.id, ownerUserId: req.user._id }).lean();
+    if (!repoDoc) {
+      return res.status(404).json({ error: "Repository not found" });
+    }
+    const hasAnalysis = await FileAnalysis.exists({ repositoryId: repoDoc._id });
+    if (!hasAnalysis) {
+      return res.status(400).json({
+        error: "No analysis found — run code analysis before viewing the dependency graph.",
+      });
+    }
+    const graph = await buildDependencyGraph(repoDoc._id);
+    res.json(graph);
   } catch (err) {
     next(err);
   }

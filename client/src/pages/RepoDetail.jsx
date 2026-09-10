@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { Link, useParams } from "react-router-dom";
 import apiFetch from "../lib/api";
 import { formatBytes, formatCount } from "../lib/format";
+import ArchitectureGraph from "../components/ArchitectureGraph";
 
 export default function RepoDetail() {
   const { id } = useParams();
@@ -11,6 +12,7 @@ export default function RepoDetail() {
   const [analysis, setAnalysis] = useState(null);
   const [analyzing, setAnalyzing] = useState(false);
   const [analysisError, setAnalysisError] = useState(null);
+  const [activeTab, setActiveTab] = useState("files");
 
   useEffect(() => {
     let cancelled = false;
@@ -123,29 +125,52 @@ export default function RepoDetail() {
         ))}
       </div>
 
-      <h2 className="mt-8 text-lg font-semibold">Files</h2>
-      <div className="mt-3 overflow-hidden rounded-lg border border-gray-800">
-        <table className="w-full text-left text-sm">
-          <thead className="bg-gray-900 text-xs uppercase tracking-wide text-gray-500">
-            <tr>
-              <th className="px-4 py-3">Path</th>
-              <th className="px-4 py-3 text-right">Size</th>
-            </tr>
-          </thead>
-          <tbody className="divide-y divide-gray-800 bg-gray-950">
-            {files.map((file) => (
-              <tr key={file.path} className="font-mono hover:bg-gray-900">
-                <td className="px-4 py-2 text-gray-300">{file.path}</td>
-                <td className="px-4 py-2 text-right text-gray-500">
-                  {formatBytes(file.size)}
-                </td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
+      <div className="mt-8 flex gap-1 border-b border-gray-800">
+        {[
+          ["files", "Files"],
+          ["analysis", "Code analysis"],
+          ["architecture", "Architecture"],
+        ].map(([key, label]) => (
+          <button
+            key={key}
+            onClick={() => setActiveTab(key)}
+            className={`border-b-2 px-4 py-2 text-sm font-medium transition ${
+              activeTab === key
+                ? "border-white text-white"
+                : "border-transparent text-gray-500 hover:text-gray-300"
+            }`}
+          >
+            {label}
+          </button>
+        ))}
       </div>
 
-      <div className="mt-10 flex items-center justify-between">
+      {activeTab === "files" && (
+        <div className="mt-4 overflow-hidden rounded-lg border border-gray-800">
+          <table className="w-full text-left text-sm">
+            <thead className="bg-gray-900 text-xs uppercase tracking-wide text-gray-500">
+              <tr>
+                <th className="px-4 py-3">Path</th>
+                <th className="px-4 py-3 text-right">Size</th>
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-gray-800 bg-gray-950">
+              {files.map((file) => (
+                <tr key={file.path} className="font-mono hover:bg-gray-900">
+                  <td className="px-4 py-2 text-gray-300">{file.path}</td>
+                  <td className="px-4 py-2 text-right text-gray-500">
+                    {formatBytes(file.size)}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+
+      {activeTab === "analysis" && (
+        <div>
+          <div className="mt-4 flex items-center justify-between">
         <div>
           <h2 className="text-lg font-semibold">Code analysis</h2>
           <p className="mt-1 text-xs text-gray-500">
@@ -237,6 +262,14 @@ export default function RepoDetail() {
             </table>
           </div>
         </>
+      )}
+        </div>
+      )}
+
+      {activeTab === "architecture" && (
+        <div className="mt-4">
+          <ArchitectureGraph repoId={id} />
+        </div>
       )}
     </div>
   );

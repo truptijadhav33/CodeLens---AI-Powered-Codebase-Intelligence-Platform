@@ -116,7 +116,7 @@ Use this section to track progress across vibe coding sessions.
 - [x] Phase 1 — GitHub OAuth + Auth
 - [x] Phase 2 — Repository Ingestion
 - [x] Phase 3 — Code Parsing + Static Analysis
-- [ ] Phase 4 — Dependency Graph + Visualization
+- [x] Phase 4 — Dependency Graph + Visualization
 - [ ] Phase 5 — RAG + Gemini Q&A
 - [ ] Phase 6 — Technical Debt Detection + AI Explanations
 - [ ] Phase 7 — AI Documentation Generation
