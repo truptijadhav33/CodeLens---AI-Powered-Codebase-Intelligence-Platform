@@ -8,6 +8,9 @@ export default function RepoDetail() {
   const [repo, setRepo] = useState(null);
   const [files, setFiles] = useState(null);
   const [error, setError] = useState(null);
+  const [analysis, setAnalysis] = useState(null);
+  const [analyzing, setAnalyzing] = useState(false);
+  const [analysisError, setAnalysisError] = useState(null);
 
   useEffect(() => {
     let cancelled = false;
@@ -26,6 +29,34 @@ export default function RepoDetail() {
       cancelled = true;
     };
   }, [id]);
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const data = await apiFetch(`/api/repos/${id}/analysis`);
+        if (!cancelled && data.repository.analysisStatus === "complete") setAnalysis(data);
+      } catch {
+        // no analysis yet — ignore
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [id]);
+
+  async function handleAnalyze() {
+    setAnalyzing(true);
+    setAnalysisError(null);
+    try {
+      const data = await apiFetch(`/api/repos/${id}/analyze`, { method: "POST" });
+      setAnalysis(data);
+    } catch (err) {
+      setAnalysisError(err.message);
+    } finally {
+      setAnalyzing(false);
+    }
+  }
 
   if (error) {
     return (
@@ -113,6 +144,100 @@ export default function RepoDetail() {
           </tbody>
         </table>
       </div>
+
+      <div className="mt-10 flex items-center justify-between">
+        <div>
+          <h2 className="text-lg font-semibold">Code analysis</h2>
+          <p className="mt-1 text-xs text-gray-500">
+            Deterministic parsing, complexity, and lint (ESLint) — JS/TS only.
+          </p>
+        </div>
+        <button
+          onClick={handleAnalyze}
+          disabled={analyzing}
+          className="rounded-lg bg-white px-4 py-2 text-sm font-semibold text-gray-950 transition hover:bg-gray-200 disabled:opacity-50"
+        >
+          {analyzing ? "Analyzing…" : "Run code analysis"}
+        </button>
+      </div>
+
+      {analysisError && (
+        <div className="mt-4 rounded-lg border border-red-900 bg-red-950/40 px-4 py-3 text-sm text-red-300">
+          {analysisError}
+        </div>
+      )}
+
+      {analyzing && (
+        <p className="mt-4 text-sm text-gray-500">
+          Running parser + complexity + ESLint on {repo.fileCount} files…
+        </p>
+      )}
+
+      {analysis && (
+        <>
+          {analysis.summary.message && (
+            <div className="mt-4 rounded-lg border border-amber-900/60 bg-amber-950/30 px-4 py-3 text-sm text-amber-300">
+              {analysis.summary.message}
+            </div>
+          )}
+
+          <div className="mt-4 grid gap-4 sm:grid-cols-4">
+            {[
+              ["Files analyzed", analysis.summary.analyzedFiles],
+              ["Unsupported", analysis.summary.unsupportedFiles],
+              ["Lint issues", analysis.summary.totalLintIssues],
+              ["Avg complexity", analysis.summary.averageComplexity],
+            ].map(([label, value]) => (
+              <div
+                key={label}
+                className="rounded-lg border border-gray-800 bg-gray-900 p-4"
+              >
+                <p className="text-xs text-gray-500">{label}</p>
+                <p className="mt-1 text-xl font-semibold">{value}</p>
+              </div>
+            ))}
+          </div>
+
+          <div className="mt-4 overflow-hidden rounded-lg border border-gray-800">
+            <table className="w-full text-left text-sm">
+              <thead className="bg-gray-900 text-xs uppercase tracking-wide text-gray-500">
+                <tr>
+                  <th className="px-4 py-3">Path</th>
+                  <th className="px-4 py-3">Language</th>
+                  <th className="px-4 py-3 text-right">Lines</th>
+                  <th className="px-4 py-3 text-right">Complexity</th>
+                  <th className="px-4 py-3 text-right">Lint issues</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-gray-800 bg-gray-950">
+                {analysis.files.length === 0 ? (
+                  <tr>
+                    <td colSpan={5} className="px-4 py-8 text-center text-gray-500">
+                      No JavaScript/TypeScript files to analyze.
+                    </td>
+                  </tr>
+                ) : (
+                  analysis.files.map((f) => (
+                    <tr key={f.path} className="font-mono hover:bg-gray-900">
+                      <td className="px-4 py-2 text-gray-300">{f.path}</td>
+                      <td className="px-4 py-2 text-gray-400">{f.language}</td>
+                      <td className="px-4 py-2 text-right text-gray-500">{f.linesOfCode}</td>
+                      <td className="px-4 py-2 text-right text-gray-500">{f.complexityScore}</td>
+                      <td
+                        className={`px-4 py-2 text-right ${
+                          f.lintIssueCount > 0 ? "text-red-400" : "text-gray-500"
+                        }`}
+                      >
+                        {f.lintIssueCount}
+                      </td>
+                    </tr>
+                  ))
+                )}
+              </tbody>
+            </table>
+          </div>
+        </>
+      )}
     </div>
   );
 }

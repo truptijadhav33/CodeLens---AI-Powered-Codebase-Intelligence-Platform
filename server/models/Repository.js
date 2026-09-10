@@ -27,6 +27,13 @@ const repositorySchema = new mongoose.Schema(
     },
     ingestedAt: Date,
     errorMessage: String,
+    analysisStatus: {
+      type: String,
+      enum: ["none", "analyzing", "complete", "failed"],
+      default: "none",
+    },
+    analysisCompletedAt: Date,
+    analysisError: String,
   },
   { timestamps: true }
 );

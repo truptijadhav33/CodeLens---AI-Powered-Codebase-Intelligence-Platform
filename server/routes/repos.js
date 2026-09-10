@@ -3,8 +3,12 @@ const mongoose = require("mongoose");
 const requireAuth = require("../middleware/requireAuth");
 const Repository = require("../models/Repository");
 const RepositoryFile = require("../models/RepositoryFile");
+const FileAnalysis = require("../models/FileAnalysis");
 const github = require("../services/github");
 const { filterRepoFiles } = require("../services/repoFilter");
+const { parseFile, getLanguage } = require("../services/codeParser");
+const { analyzeFile } = require("../services/complexity");
+const { lintContent } = require("../services/lintService");
 
 const router = express.Router();
 
@@ -33,6 +37,9 @@ function serializeRepo(doc) {
     status: doc.status,
     ingestedAt: doc.ingestedAt,
     errorMessage: doc.errorMessage,
+    analysisStatus: doc.analysisStatus || "none",
+    analysisCompletedAt: doc.analysisCompletedAt,
+    analysisError: doc.analysisError,
   };
 }
 
@@ -45,6 +52,106 @@ async function insertFilesBatch(repoId, files) {
     const batch = files.slice(i, i + INSERT_BATCH_SIZE);
     await RepositoryFile.insertMany(batch, { ordered: false });
   }
+}
+
+function buildAnalysisSummary(analysisDocs, totalFiles) {
+  const analyzedFiles = analysisDocs.length;
+  const totalLintIssues = analysisDocs.reduce((sum, f) => sum + f.lintIssues.length, 0);
+  const averageComplexity =
+    analyzedFiles === 0 ? 0 : analysisDocs.reduce((sum, f) => sum + f.complexityScore, 0) / analyzedFiles;
+  return {
+    totalFiles,
+    analyzedFiles,
+    unsupportedFiles: Math.max(totalFiles - analyzedFiles, 0),
+    totalLintIssues,
+    averageComplexity: Math.round(averageComplexity * 100) / 100,
+  };
+}
+
+function serializeAnalysisFile(doc) {
+  return {
+    id: String(doc._id),
+    path: doc.path,
+    language: doc.language,
+    linesOfCode: doc.linesOfCode,
+    complexityScore: doc.complexityScore,
+    lintIssueCount: doc.lintIssues.length,
+    status: doc.status,
+    parseError: doc.parseError || null,
+  };
+}
+
+function analysisMessage(summary) {
+  if (summary.totalFiles === 0) {
+    return "Repository has no ingested files.";
+  }
+  if (summary.analyzedFiles === 0) {
+    return `No JavaScript/TypeScript files found to analyze — ${summary.unsupportedFiles} file(s) skipped as unsupported language.`;
+  }
+  if (summary.unsupportedFiles > 0) {
+    return `${summary.unsupportedFiles} non-JavaScript/TypeScript file(s) skipped (unsupported language).`;
+  }
+  return null;
+}
+
+async function analyzeRepository(repoDoc) {
+  const repoFiles = await RepositoryFile.find({ repositoryId: repoDoc._id }).lean();
+  const supportedFiles = repoFiles.filter((f) => getLanguage(f.path));
+  const unsupportedFiles = repoFiles.length - supportedFiles.length;
+
+  const analysisDocs = [];
+  for (const file of supportedFiles) {
+    const parseResult = parseFile(file.content, file.path);
+    const base = {
+      repositoryId: repoDoc._id,
+      path: file.path,
+      language: parseResult.language,
+      linesOfCode: parseResult.linesOfCode || 0,
+    };
+
+    if (parseResult.unsupported) {
+      continue;
+    }
+    if (parseResult.parseError) {
+      const lint = await lintContent(file.content, file.path);
+      analysisDocs.push({
+        ...base,
+        status: "parse_error",
+        parseError: parseResult.parseError,
+        complexityScore: 0,
+        lintIssues: lint.lintIssues,
+      });
+      continue;
+    }
+
+    const complexity = analyzeFile(parseResult);
+    const lint = await lintContent(file.content, file.path);
+    analysisDocs.push({
+      ...base,
+      status: "analyzed",
+      imports: parseResult.imports,
+      exports: parseResult.exports,
+      functions: complexity.functions,
+      classes: parseResult.classes,
+      complexityScore: complexity.complexityScore,
+      lintIssues: lint.lintIssues,
+      analyzedAt: new Date(),
+    });
+  }
+
+  // Replace stale results from any previous analysis run.
+  await FileAnalysis.deleteMany({ repositoryId: repoDoc._id });
+  await insertDocsBatch(FileAnalysis, analysisDocs);
+
+  return { analysisDocs, unsupportedFiles, totalFiles: repoFiles.length };
+}
+
+function insertDocsBatch(Model, docs) {
+  const tasks = [];
+  for (let i = 0; i < docs.length; i += INSERT_BATCH_SIZE) {
+    tasks.push(Model.insertMany(docs.slice(i, i + INSERT_BATCH_SIZE), { ordered: false }));
+  }
+  return Promise.all(tasks);
 }
 
 // List repositories the user owns or collaborates on (all pages).
@@ -176,6 +283,79 @@ router.get("/mine", async (req, res, next) => {
       .select({ __v: 0 })
       .lean();
     res.json({ repos: repos.map((r) => serializeRepo(r)) });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// Run deterministic code parsing + complexity + lint on an ingested repo.
+router.post("/:id/analyze", async (req, res, next) => {
+  try {
+    if (!mongoose.isValidObjectId(req.params.id)) {
+      return res.status(404).json({ error: "Repository not found" });
+    }
+    const repoDoc = await Repository.findOne({ _id: req.params.id, ownerUserId: req.user._id });
+    if (!repoDoc) {
+      return res.status(404).json({ error: "Repository not found" });
+    }
+    const existing = await RepositoryFile.countDocuments({ repositoryId: repoDoc._id });
+    if (existing === 0) {
+      return res.status(400).json({
+        error: "Repository has no ingested files — run ingestion before analysis.",
+      });
+    }
+
+    repoDoc.analysisStatus = "analyzing";
+    repoDoc.analysisError = null;
+    await repoDoc.save();
+
+    try {
+      const { analysisDocs, unsupportedFiles, totalFiles } = await analyzeRepository(repoDoc);
+
+      repoDoc.analysisStatus = "complete";
+      repoDoc.analysisCompletedAt = new Date();
+      await repoDoc.save();
+
+      const summary = buildAnalysisSummary(analysisDocs, totalFiles);
+      summary.unsupportedFiles = unsupportedFiles;
+      summary.message = analysisMessage(summary);
+      res.status(201).json({
+        repository: serializeRepo(repoDoc),
+        summary,
+        files: analysisDocs.map(serializeAnalysisFile),
+      });
+    } catch (err) {
+      repoDoc.analysisStatus = "failed";
+      repoDoc.analysisError = err.message;
+      await repoDoc.save();
+      throw err;
+    }
+  } catch (err) {
+    next(err);
+  }
+});
+
+// Analysis summary + per-file results (light: no full lint detail).
+router.get("/:id/analysis", async (req, res, next) => {
+  try {
+    if (!mongoose.isValidObjectId(req.params.id)) {
+      return res.status(404).json({ error: "Repository not found" });
+    }
+    const repoDoc = await Repository.findOne({ _id: req.params.id, ownerUserId: req.user._id }).lean();
+    if (!repoDoc) {
+      return res.status(404).json({ error: "Repository not found" });
+    }
+    const [analysisDocs, totalFiles] = await Promise.all([
+      FileAnalysis.find({ repositoryId: repoDoc._id }).sort({ path: 1 }).lean(),
+      RepositoryFile.countDocuments({ repositoryId: repoDoc._id }),
+    ]);
+    const summary = buildAnalysisSummary(analysisDocs, totalFiles);
+    summary.message = analysisMessage(summary);
+    res.json({
+      repository: { id: String(repoDoc._id), analysisStatus: repoDoc.analysisStatus, analysisCompletedAt: repoDoc.analysisCompletedAt },
+      summary,
+      files: analysisDocs.map(serializeAnalysisFile),
+    });
   } catch (err) {
     next(err);
   }
