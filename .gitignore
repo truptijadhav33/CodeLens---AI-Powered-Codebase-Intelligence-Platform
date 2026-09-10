@@ -1,0 +1,21 @@
+node_modules/
+dist/
+.env
+.env.local
+*.env
+*.log
+# Keep committed env templates (never real values)
+!*.env.example
+
+# Client
+client/dist/
+client/.env
+client/.env.local
+
+# Server
+server/.env
+server/.env.local
+
+# Credentials
+atlas-credentials.env
+github credentials.txt
