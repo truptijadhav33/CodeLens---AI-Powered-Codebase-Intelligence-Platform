@@ -4,6 +4,7 @@ const cors = require("cors");
 const mongoose = require("mongoose");
 const cookieParser = require("cookie-parser");
 const authRoutes = require("./routes/auth");
+const repoRoutes = require("./routes/repos");
 
 const app = express();
 const PORT = process.env.PORT || 5000;
@@ -22,6 +23,12 @@ app.get("/api/health", (_req, res) => {
 });
 
 app.use("/auth", authRoutes);
+app.use("/api/repos", repoRoutes);
+
+app.use((err, _req, res, _next) => {
+  console.error("Unhandled error:", err);
+  res.status(500).json({ error: "Internal server error" });
+});
 
 const MONGODB_URI = process.env.MONGODB_URI;
 
