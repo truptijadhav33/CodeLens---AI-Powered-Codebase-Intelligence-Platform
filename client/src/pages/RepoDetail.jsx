@@ -5,6 +5,7 @@ import { formatBytes, formatCount } from "../lib/format";
 import ArchitectureGraph from "../components/ArchitectureGraph";
 import AskTab from "../components/AskTab";
 import IssuesTab from "../components/IssuesTab";
+import DocsTab from "../components/DocsTab";
 
 export default function RepoDetail() {
   const { id } = useParams();
@@ -134,6 +135,7 @@ export default function RepoDetail() {
           ["architecture", "Architecture"],
           ["issues", "Issues"],
           ["ask", "Ask"],
+          ["docs", "Docs"],
         ].map(([key, label]) => (
           <button
             key={key}
@@ -285,6 +287,12 @@ export default function RepoDetail() {
       {activeTab === "ask" && (
         <div className="mt-4">
           <AskTab repoId={id} />
+        </div>
+      )}
+
+      {activeTab === "docs" && (
+        <div className="mt-4">
+          <DocsTab repoId={id} repoName={repo.fullName} />
         </div>
       )}
     </div>

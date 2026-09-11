@@ -24,6 +24,8 @@ const { retrieveRelevantChunks } = require("../services/retrieval");
 const { generateAnswer, explainIssue } = require("../services/gemini");
 const { detectIssues } = require("../services/issueDetection");
 const Issue = require("../models/Issue");
+const Documentation = require("../models/Documentation");
+const { SECTION_TYPES, generateSection, docIsFresh } = require("../services/docGenerator");
 
 const router = express.Router();
 
@@ -40,6 +42,10 @@ const askRateStore = new Map();
 const EXPLAIN_RATE_LIMIT = 10;
 const EXPLAIN_WINDOW_MS = 60 * 1000;
 const explainRateStore = new Map();
+
+const DOCS_RATE_LIMIT = 5;
+const DOCS_WINDOW_MS = 60 * 1000;
+const docsRateStore = new Map();
 
 const SEVERITY_RANK = { high: 0, medium: 1, low: 2 };
 
@@ -59,6 +65,10 @@ function checkAskRateLimit(userId) {
 
 function checkExplainRateLimit(userId) {
   return checkRateLimit(explainRateStore, userId, EXPLAIN_RATE_LIMIT, EXPLAIN_WINDOW_MS);
+}
+
+function checkDocsRateLimit(userId) {
+  return checkRateLimit(docsRateStore, userId, DOCS_RATE_LIMIT, DOCS_WINDOW_MS);
 }
 
 router.use(requireAuth);
@@ -925,6 +935,157 @@ router.post("/:id/issues/:issueId/explain", async (req, res, next) => {
       cached: false,
     });
   } catch (err) {
+    next(err);
+  }
+});
+
+// ---------- Documentation generation routes (Phase 7) ----------
+
+function serializeDoc(doc) {
+  return {
+    sectionType: doc.sectionType,
+    content: doc.content,
+    sourceFiles: doc.sourceFiles || [],
+    generatedAt: doc.generatedAt,
+  };
+}
+
+// List cached documentation sections for this repo (GET — returns null for ungenerated).
+router.get("/:id/docs", async (req, res, next) => {
+  try {
+    if (!mongoose.isValidObjectId(req.params.id)) return res.status(404).json({ error: "Repository not found" });
+    const repoDoc = await Repository.findOne({ _id: req.params.id, ownerUserId: req.user._id }).lean();
+    if (!repoDoc) return res.status(404).json({ error: "Repository not found" });
+
+    const docs = await Documentation.find({ repositoryId: repoDoc._id }).lean();
+    const byType = new Map(docs.map((d) => [d.sectionType, d]));
+    const sections = SECTION_TYPES.map((st) => {
+      const doc = byType.get(st);
+      return doc ? serializeDoc(doc) : { sectionType: st, content: null, sourceFiles: [], generatedAt: null };
+    });
+    res.json({ repositoryId: String(repoDoc._id), sections });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// Generate documentation sections sequentially — skip sections already generated
+// after the last analysis run; process sequentially to avoid parallel Gemini calls.
+router.post("/:id/docs/generate", async (req, res, next) => {
+  try {
+    if (!mongoose.isValidObjectId(req.params.id)) return res.status(404).json({ error: "Repository not found" });
+    const repoDoc = await Repository.findOne({ _id: req.params.id, ownerUserId: req.user._id });
+    if (!repoDoc) return res.status(404).json({ error: "Repository not found" });
+
+    const hasAnalysis = await FileAnalysis.exists({ repositoryId: repoDoc._id });
+    if (!hasAnalysis) {
+      return res.status(400).json({ error: "No analysis found — run code analysis before generating documentation." });
+    }
+
+    // Determine which sections to generate (default: all).
+    let requested = SECTION_TYPES;
+    if (req.body && Array.isArray(req.body.sections) && req.body.sections.length > 0) {
+      requested = req.body.sections.filter((s) => SECTION_TYPES.includes(s));
+      if (requested.length === 0) {
+        return res.status(400).json({ error: "Invalid section type(s). Valid types: " + SECTION_TYPES.join(", ") });
+      }
+    }
+
+    if (!checkDocsRateLimit(req.user._id)) {
+      return res.status(429).json({ error: "Rate limit: max 5 documentation requests per minute. Please wait." });
+    }
+
+    // Pre-check API key only if at least one section needs regeneration.
+    const existingDocs = await Documentation.find({ repositoryId: repoDoc._id, sectionType: { $in: requested } }).lean();
+    const existingByType = new Map(existingDocs.map((d) => [d.sectionType, d]));
+    const needsGeneration = requested.filter((st) => !docIsFresh(existingByType.get(st), repoDoc));
+
+    if (needsGeneration.length > 0 && !process.env.GEMINI_API_KEY) {
+      return res.status(500).json({ error: "GEMINI_API_KEY is not configured on the server." });
+    }
+
+    const sections = [];
+    const generated = [];
+    const cached = [];
+    const errors = [];
+
+    for (const st of requested) {
+      const existing = existingByType.get(st);
+      if (docIsFresh(existing, repoDoc)) {
+        cached.push(st);
+        sections.push(serializeDoc(existing));
+        continue;
+      }
+      try {
+        const { content, sourceFiles } = await generateSection(repoDoc._id, st, repoDoc);
+        const doc = await Documentation.findOneAndUpdate(
+          { repositoryId: repoDoc._id, sectionType: st },
+          { $set: { content, sourceFiles, generatedAt: new Date() } },
+          { upsert: true, new: true }
+        );
+        generated.push(st);
+        sections.push(serializeDoc(doc));
+      } catch (err) {
+        errors.push({ sectionType: st, error: err.message });
+        const fallback = existing
+          ? serializeDoc(existing)
+          : { sectionType: st, content: null, sourceFiles: [], generatedAt: null };
+        sections.push(fallback);
+      }
+    }
+
+    res.json({
+      repositoryId: String(repoDoc._id),
+      sections,
+      generated,
+      cached,
+      errors,
+      message: `Generated ${generated.length} section(s), ${cached.length} cached, ${errors.length} failed.`,
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// Force-regenerate a single documentation section (bypass cache). Rate-limited.
+router.post("/:id/docs/:sectionType/regenerate", async (req, res, next) => {
+  try {
+    const { sectionType } = req.params;
+    if (!SECTION_TYPES.includes(sectionType)) {
+      return res.status(400).json({ error: `Invalid section type: ${sectionType}. Valid types: ${SECTION_TYPES.join(", ")}` });
+    }
+    if (!mongoose.isValidObjectId(req.params.id)) return res.status(404).json({ error: "Repository not found" });
+    const repoDoc = await Repository.findOne({ _id: req.params.id, ownerUserId: req.user._id });
+    if (!repoDoc) return res.status(404).json({ error: "Repository not found" });
+
+    const hasAnalysis = await FileAnalysis.exists({ repositoryId: repoDoc._id });
+    if (!hasAnalysis) {
+      return res.status(400).json({ error: "No analysis found — run code analysis before generating documentation." });
+    }
+
+    if (!checkDocsRateLimit(req.user._id)) {
+      return res.status(429).json({ error: "Rate limit: max 5 documentation requests per minute. Please wait." });
+    }
+    if (!process.env.GEMINI_API_KEY) {
+      return res.status(500).json({ error: "GEMINI_API_KEY is not configured on the server." });
+    }
+
+    const { content, sourceFiles } = await generateSection(repoDoc._id, sectionType, repoDoc);
+    const doc = await Documentation.findOneAndUpdate(
+      { repositoryId: repoDoc._id, sectionType },
+      { $set: { content, sourceFiles, generatedAt: new Date() } },
+      { upsert: true, new: true }
+    );
+
+    res.json({
+      repositoryId: String(repoDoc._id),
+      section: serializeDoc(doc),
+      message: `${sectionType} section regenerated.`,
+    });
+  } catch (err) {
+    if (/503|UNAVAILABLE|high demand/i.test(err.message)) {
+      return res.status(503).json({ error: err.message });
+    }
     next(err);
   }
 });
