@@ -34,6 +34,14 @@ const repositorySchema = new mongoose.Schema(
     },
     analysisCompletedAt: Date,
     analysisError: String,
+    embeddingStatus: {
+      type: String,
+      enum: ["none", "embedding", "complete", "failed"],
+      default: "none",
+    },
+    embeddingCompletedAt: Date,
+    embeddingError: String,
+    embeddingCount: { type: Number, default: 0 },
   },
   { timestamps: true }
 );

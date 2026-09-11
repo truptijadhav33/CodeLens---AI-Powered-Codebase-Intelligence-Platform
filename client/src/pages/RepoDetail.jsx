@@ -3,6 +3,7 @@ import { Link, useParams } from "react-router-dom";
 import apiFetch from "../lib/api";
 import { formatBytes, formatCount } from "../lib/format";
 import ArchitectureGraph from "../components/ArchitectureGraph";
+import AskTab from "../components/AskTab";
 
 export default function RepoDetail() {
   const { id } = useParams();
@@ -130,6 +131,7 @@ export default function RepoDetail() {
           ["files", "Files"],
           ["analysis", "Code analysis"],
           ["architecture", "Architecture"],
+          ["ask", "Ask"],
         ].map(([key, label]) => (
           <button
             key={key}
@@ -269,6 +271,12 @@ export default function RepoDetail() {
       {activeTab === "architecture" && (
         <div className="mt-4">
           <ArchitectureGraph repoId={id} />
+        </div>
+      )}
+
+      {activeTab === "ask" && (
+        <div className="mt-4">
+          <AskTab repoId={id} />
         </div>
       )}
     </div>

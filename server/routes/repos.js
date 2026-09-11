@@ -10,6 +10,18 @@ const { parseFile, getLanguage } = require("../services/codeParser");
 const { analyzeFile } = require("../services/complexity");
 const { lintContent } = require("../services/lintService");
 const { buildDependencyGraph } = require("../services/dependencyGraph");
+const Chunk = require("../models/Chunk");
+const ChatMessage = require("../models/ChatMessage");
+const { isEligibleFile, chunkFile, estimateTokens } = require("../services/chunker");
+const {
+  embedChunks,
+  hashContent,
+  GEMINI_EMBED_MODEL,
+  EMBEDDING_DIMENSION,
+  DailyQuotaError,
+} = require("../services/embeddings");
+const { retrieveRelevantChunks } = require("../services/retrieval");
+const { generateAnswer } = require("../services/gemini");
 
 const router = express.Router();
 
@@ -18,6 +30,20 @@ const MAX_REPO_SIZE_MB = parseInt(process.env.MAX_REPO_SIZE_MB || "50", 10);
 const MAX_REPO_SIZE_BYTES = MAX_REPO_SIZE_MB * 1024 * 1024;
 const MAX_FILE_BYTES = 500 * 1024;
 const INSERT_BATCH_SIZE = 100;
+
+const ASK_RATE_LIMIT = 10;
+const ASK_WINDOW_MS = 60 * 1000;
+const askRateStore = new Map();
+
+function checkAskRateLimit(userId) {
+  const key = String(userId);
+  const now = Date.now();
+  const stamps = (askRateStore.get(key) || []).filter((t) => now - t < ASK_WINDOW_MS);
+  if (stamps.length >= ASK_RATE_LIMIT) return false;
+  stamps.push(now);
+  askRateStore.set(key, stamps);
+  return true;
+}
 
 router.use(requireAuth);
 
@@ -41,6 +67,10 @@ function serializeRepo(doc) {
     analysisStatus: doc.analysisStatus || "none",
     analysisCompletedAt: doc.analysisCompletedAt,
     analysisError: doc.analysisError,
+    embeddingStatus: doc.embeddingStatus || "none",
+    embeddingCompletedAt: doc.embeddingCompletedAt,
+    embeddingCount: doc.embeddingCount || 0,
+    embeddingError: doc.embeddingError,
   };
 }
 
@@ -380,6 +410,258 @@ router.get("/:id/graph", async (req, res, next) => {
     }
     const graph = await buildDependencyGraph(repoDoc._id);
     res.json(graph);
+  } catch (err) {
+    next(err);
+  }
+});
+
+// Chunk + embed eligible files for RAG (JS/TS + markdown). Delete-then-insert.
+router.post("/:id/embed", async (req, res, next) => {
+  try {
+    if (!mongoose.isValidObjectId(req.params.id)) {
+      return res.status(404).json({ error: "Repository not found" });
+    }
+    const repoDoc = await Repository.findOne({ _id: req.params.id, ownerUserId: req.user._id });
+    if (!repoDoc) return res.status(404).json({ error: "Repository not found" });
+
+    const repoFiles = await RepositoryFile.find({ repositoryId: repoDoc._id }).lean();
+    const eligibleFiles = repoFiles.filter((f) => isEligibleFile(f.path));
+    if (eligibleFiles.length === 0) {
+      return res.status(400).json({ error: "No eligible files to embed (JS/TS or markdown required)." });
+    }
+
+    const existingChunks = await Chunk.countDocuments({ repositoryId: repoDoc._id });
+    const force = req.query.force === "true";
+    if (existingChunks > 0 && !force) {
+      const stale =
+        repoDoc.embeddingCompletedAt &&
+        repoDoc.analysisCompletedAt &&
+        repoDoc.embeddingCompletedAt >= repoDoc.analysisCompletedAt;
+      const upToDate = repoDoc.embeddingStatus === "complete" && (stale || !repoDoc.analysisCompletedAt);
+      if (upToDate) {
+        return res.status(409).json({
+          error: "Embeddings already exist and repository has not been re-analyzed since. Use ?force=true to re-embed.",
+          embeddingCount: existingChunks,
+          embeddingCompletedAt: repoDoc.embeddingCompletedAt,
+        });
+      }
+    }
+
+    if (!process.env.GEMINI_API_KEY) {
+      return res.status(500).json({ error: "GEMINI_API_KEY is not configured on the server." });
+    }
+
+    repoDoc.embeddingStatus = "embedding";
+    repoDoc.embeddingError = null;
+    await repoDoc.save();
+
+    try {
+      const analysisMap = new Map();
+      const analyses = await FileAnalysis.find({ repositoryId: repoDoc._id }).lean();
+      for (const a of analyses) analysisMap.set(a.path, a);
+
+      const allChunks = [];
+      for (const file of eligibleFiles) {
+        const analysis = analysisMap.get(file.path) || null;
+        const parts = chunkFile(file.content, file.path, analysis);
+        for (let i = 0; i < parts.length; i++) {
+          const content = parts[i];
+          allChunks.push({
+            repositoryId: repoDoc._id,
+            path: file.path,
+            chunkIndex: i,
+            content,
+            tokenCount: estimateTokens(content),
+            contentHash: hashContent(content),
+          });
+        }
+      }
+
+      if (allChunks.length === 0) {
+        throw new Error("Chunking produced no chunks");
+      }
+
+      // Reuse stored embeddings for unchanged chunks (content-hash skip) so iterative
+      // re-embeds do not burn daily Gemini quota; only changed/new chunks are embedded.
+      const { chunks: finalChunks, skipped, embedded } = await embedChunks(allChunks, "RETRIEVAL_DOCUMENT");
+
+      await Chunk.deleteMany({ repositoryId: repoDoc._id });
+      await insertDocsBatch(Chunk, finalChunks);
+
+      repoDoc.embeddingStatus = "complete";
+      repoDoc.embeddingCompletedAt = new Date();
+      repoDoc.embeddingCount = finalChunks.length;
+      await repoDoc.save();
+
+      res.status(201).json({
+        repository: serializeRepo(repoDoc),
+        model: GEMINI_EMBED_MODEL,
+        dimension: EMBEDDING_DIMENSION,
+        chunksCreated: finalChunks.length,
+        chunksSkipped: skipped,
+        chunksEmbedded: embedded,
+        eligibleFiles: eligibleFiles.length,
+      });
+    } catch (err) {
+      repoDoc.embeddingStatus = "failed";
+      repoDoc.embeddingError = err.message;
+      await repoDoc.save();
+      if (err instanceof DailyQuotaError) {
+        // RPD quota resets at midnight Pacific — don't sit on retries that can't
+        // succeed today. Return a clean, actionable 429.
+        return res.status(429).json({ error: err.message });
+      }
+      throw err;
+    }
+  } catch (err) {
+    next(err);
+  }
+});
+
+// Embedding status (lightweight check for frontend).
+router.get("/:id/embed-status", async (req, res, next) => {
+  try {
+    if (!mongoose.isValidObjectId(req.params.id)) return res.status(404).json({ error: "Repository not found" });
+    const repoDoc = await Repository.findOne({ _id: req.params.id, ownerUserId: req.user._id }).lean();
+    if (!repoDoc) return res.status(404).json({ error: "Repository not found" });
+    const chunkCount = await Chunk.countDocuments({ repositoryId: repoDoc._id });
+    res.json({
+      embeddingStatus: repoDoc.embeddingStatus || "none",
+      embeddingCount: chunkCount,
+      embeddingCompletedAt: repoDoc.embeddingCompletedAt,
+      dimension: EMBEDDING_DIMENSION,
+      model: GEMINI_EMBED_MODEL,
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// Chat history for this repo (owner-only, most recent first, paginated).
+router.get("/:id/chat-history", async (req, res, next) => {
+  try {
+    if (!mongoose.isValidObjectId(req.params.id)) return res.status(404).json({ error: "Repository not found" });
+    const repoDoc = await Repository.findOne({ _id: req.params.id, ownerUserId: req.user._id }).lean();
+    if (!repoDoc) return res.status(404).json({ error: "Repository not found" });
+    const page = Math.max(parseInt(req.query.page || "1", 10), 1);
+    const limit = Math.min(Math.max(parseInt(req.query.limit || "20", 10), 1), 50);
+    const skip = (page - 1) * limit;
+    const [messages, total] = await Promise.all([
+      ChatMessage.find({ repositoryId: repoDoc._id, userId: req.user._id })
+        .sort({ createdAt: -1 })
+        .skip(skip)
+        .limit(limit)
+        .lean(),
+      ChatMessage.countDocuments({ repositoryId: repoDoc._id, userId: req.user._id }),
+    ]);
+    res.json({
+      messages: messages.map((m) => ({
+        id: String(m._id),
+        role: m.role,
+        content: m.content,
+        sourceFiles: m.sourceFiles || [],
+        createdAt: m.createdAt,
+      })),
+      total,
+      page,
+      limit,
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// RAG Q&A — retrieve relevant chunks, call Gemini, store chat history. Rate limited.
+router.post("/:id/ask", async (req, res, next) => {
+  try {
+    if (!mongoose.isValidObjectId(req.params.id)) return res.status(404).json({ error: "Repository not found" });
+    const repoDoc = await Repository.findOne({ _id: req.params.id, ownerUserId: req.user._id });
+    if (!repoDoc) return res.status(404).json({ error: "Repository not found" });
+
+    const { question } = req.body || {};
+    if (!question || typeof question !== "string" || question.trim().length < 3) {
+      return res.status(400).json({ error: "question is required (min 3 chars)" });
+    }
+    if (question.length > 2000) return res.status(400).json({ error: "question too long (max 2000 chars)" });
+
+    if (!checkAskRateLimit(req.user._id)) {
+      return res.status(429).json({ error: "Rate limit: max 10 questions per minute. Please wait." });
+    }
+
+    const chunkCount = await Chunk.countDocuments({ repositoryId: repoDoc._id });
+    if (chunkCount === 0) {
+      return res.status(400).json({ error: "No embeddings found — generate embeddings first via POST /:id/embed." });
+    }
+
+    if (!process.env.GEMINI_API_KEY) {
+      return res.status(500).json({ error: "GEMINI_API_KEY is not configured on the server." });
+    }
+
+    const tTotal = Date.now();
+    let relevantChunks = [];
+    let embedMs = 0;
+    let vectorMs = 0;
+    try {
+      const retrieved = await retrieveRelevantChunks(repoDoc._id, question.trim());
+      relevantChunks = retrieved.chunks;
+      embedMs = retrieved.embedMs;
+      vectorMs = retrieved.vectorMs;
+    } catch (err) {
+      // If vector index missing or not ready, surface a clear error
+      if (err instanceof DailyQuotaError) {
+        return res.status(429).json({ error: err.message });
+      }
+      return res.status(500).json({ error: `Retrieval failed: ${err.message}. Ensure the Atlas Vector Search index "vector_index" exists and is Ready.` });
+    }
+
+    if (relevantChunks.length === 0) {
+      return res.status(500).json({ error: "No relevant chunks retrieved — try re-embedding." });
+    }
+
+    const sourceFiles = [...new Set(relevantChunks.map((c) => c.path))];
+    let answer;
+    let genMs = 0;
+    const tGen = Date.now();
+    try {
+      const result = await generateAnswer(question.trim(), relevantChunks);
+      answer = result.answer;
+      genMs = Date.now() - tGen;
+    } catch (err) {
+      genMs = Date.now() - tGen;
+      const totalMs = Date.now() - tTotal;
+      console.log(`[ask] embed: ${embedMs}ms, vectorSearch: ${vectorMs}ms, generateContent: ${genMs}ms (failed), total: ${totalMs}ms`);
+      // Surface 503 as 503 so the UI can show "high demand, try again" instead of generic 500
+      if (/503|UNAVAILABLE|high demand/.test(err.message)) {
+        return res.status(503).json({ error: "Gemini is currently overloaded (503). Please try again in a few seconds." });
+      }
+      throw err;
+    }
+    const totalMs = Date.now() - tTotal;
+    console.log(`[ask] embed: ${embedMs}ms, vectorSearch: ${vectorMs}ms, generateContent: ${genMs}ms, total: ${totalMs}ms`);
+
+    const userMsg = await ChatMessage.create({
+      repositoryId: repoDoc._id,
+      userId: req.user._id,
+      role: "user",
+      content: question.trim(),
+    });
+    const assistantMsg = await ChatMessage.create({
+      repositoryId: repoDoc._id,
+      userId: req.user._id,
+      role: "assistant",
+      content: answer,
+      sourceFiles,
+    });
+
+    res.json({
+      answer,
+      sourceFiles,
+      chunksUsed: relevantChunks.length,
+      messages: [
+        { id: String(userMsg._id), role: "user", content: userMsg.content, createdAt: userMsg.createdAt },
+        { id: String(assistantMsg._id), role: "assistant", content: answer, sourceFiles, createdAt: assistantMsg.createdAt },
+      ],
+    });
   } catch (err) {
     next(err);
   }
