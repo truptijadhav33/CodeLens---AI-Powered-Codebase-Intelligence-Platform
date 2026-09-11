@@ -1,6 +1,19 @@
 const { ESLint } = require("eslint");
 const js = require("@eslint/js");
 const tsParser = require("@typescript-eslint/parser");
+const globals = require("globals");
+
+// Analyzed repos may be frontend (browser), backend (node), CommonJS backend
+// code (require/module/exports/__dirname), or Jest test files (describe/it/
+// expect/jest). We can't know per-file, so the lint pass declares all of them.
+// Without this, standard globals like window, document, fetch, process, require,
+// or expect fire false-positive no-undef errors.
+const GLOBAL_ENV = {
+  ...globals.browser,
+  ...globals.node,
+  ...globals.commonjs,
+  ...globals.jest,
+};
 
 let eslintInstance = null;
 
@@ -14,16 +27,18 @@ function getESLint() {
           files: ["**/*.{ts,tsx}"],
           languageOptions: {
             parser: tsParser,
+            globals: { ...GLOBAL_ENV },
+            ecmaVersion: "latest",
             sourceType: "module",
-            ecmaVersion: 2022,
             parserOptions: { ecmaFeatures: { jsx: true } },
           },
         },
         {
           files: ["**/*.{js,jsx}"],
           languageOptions: {
+            globals: { ...GLOBAL_ENV },
+            ecmaVersion: "latest",
             sourceType: "module",
-            ecmaVersion: 2022,
             parserOptions: { ecmaFeatures: { jsx: true } },
           },
         },
@@ -49,4 +64,4 @@ async function lintContent(content, filePath) {
   return { lintIssues, errorCount: result.errorCount, warningCount: result.warningCount };
 }
 
-module.exports = { lintContent };
+module.exports = { lintContent, GLOBAL_ENV };

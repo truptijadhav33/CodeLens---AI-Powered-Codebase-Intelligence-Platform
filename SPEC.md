@@ -118,6 +118,6 @@ Use this section to track progress across vibe coding sessions.
 - [x] Phase 3 — Code Parsing + Static Analysis
 - [x] Phase 4 — Dependency Graph + Visualization
 - [x] Phase 5 — RAG + Gemini Q&A
-- [ ] Phase 6 — Technical Debt Detection + AI Explanations
+- [x] Phase 6 — Technical Debt Detection + AI Explanations
 - [ ] Phase 7 — AI Documentation Generation
 - [ ] Phase 8 — Dashboard Polish + Deploy

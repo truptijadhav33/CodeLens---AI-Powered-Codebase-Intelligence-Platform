@@ -21,7 +21,9 @@ const {
   DailyQuotaError,
 } = require("../services/embeddings");
 const { retrieveRelevantChunks } = require("../services/retrieval");
-const { generateAnswer } = require("../services/gemini");
+const { generateAnswer, explainIssue } = require("../services/gemini");
+const { detectIssues } = require("../services/issueDetection");
+const Issue = require("../models/Issue");
 
 const router = express.Router();
 
@@ -35,14 +37,28 @@ const ASK_RATE_LIMIT = 10;
 const ASK_WINDOW_MS = 60 * 1000;
 const askRateStore = new Map();
 
-function checkAskRateLimit(userId) {
+const EXPLAIN_RATE_LIMIT = 10;
+const EXPLAIN_WINDOW_MS = 60 * 1000;
+const explainRateStore = new Map();
+
+const SEVERITY_RANK = { high: 0, medium: 1, low: 2 };
+
+function checkRateLimit(store, userId, limit, windowMs) {
   const key = String(userId);
   const now = Date.now();
-  const stamps = (askRateStore.get(key) || []).filter((t) => now - t < ASK_WINDOW_MS);
-  if (stamps.length >= ASK_RATE_LIMIT) return false;
+  const stamps = (store.get(key) || []).filter((t) => now - t < windowMs);
+  if (stamps.length >= limit) return false;
   stamps.push(now);
-  askRateStore.set(key, stamps);
+  store.set(key, stamps);
   return true;
+}
+
+function checkAskRateLimit(userId) {
+  return checkRateLimit(askRateStore, userId, ASK_RATE_LIMIT, ASK_WINDOW_MS);
+}
+
+function checkExplainRateLimit(userId) {
+  return checkRateLimit(explainRateStore, userId, EXPLAIN_RATE_LIMIT, EXPLAIN_WINDOW_MS);
 }
 
 router.use(requireAuth);
@@ -183,6 +199,70 @@ function insertDocsBatch(Model, docs) {
     tasks.push(Model.insertMany(docs.slice(i, i + INSERT_BATCH_SIZE), { ordered: false }));
   }
   return Promise.all(tasks);
+}
+
+function serializeIssue(doc) {
+  return {
+    id: String(doc._id),
+    type: doc.type,
+    severity: doc.severity,
+    filePath: doc.filePath,
+    relatedFilePath: doc.relatedFilePath || null,
+    message: doc.message,
+    detail: doc.detail || {},
+    aiExplanation: doc.aiExplanation || null,
+    aiSuggestion: doc.aiSuggestion || null,
+    createdAt: doc.createdAt,
+  };
+}
+
+async function summarizeIssues(repositoryId) {
+  const [typeRows, severityRows] = await Promise.all([
+    Issue.aggregate([
+      { $match: { repositoryId } },
+      { $group: { _id: "$type", count: { $sum: 1 } } },
+    ]),
+    Issue.aggregate([
+      { $match: { repositoryId } },
+      { $group: { _id: "$severity", count: { $sum: 1 } } },
+    ]),
+  ]);
+  const byType = {};
+  const bySeverity = {};
+  for (const r of typeRows) byType[r._id] = r.count;
+  for (const r of severityRows) bySeverity[r._id] = r.count;
+  const total = Object.values(byType).reduce((sum, n) => sum + n, 0);
+  return { total, byType, bySeverity };
+}
+
+// Pulls a bounded excerpt of a repository file around the issue's location so
+// the AI explanation is grounded in the actual code (no full-file blast).
+async function issueExcerpt(repositoryId, filePath, anchorLine) {
+  const file = await RepositoryFile.findOne({ repositoryId, path: filePath }).lean();
+  if (!file) return null;
+  const lines = file.content.split("\n");
+  const center = anchorLine
+    ? Math.min(Math.max(anchorLine - 1, 0), Math.max(lines.length - 1, 0))
+    : 0;
+  const start = Math.max(0, center - 40);
+  const end = Math.min(lines.length, center + 80);
+  return { path: filePath, excerpt: lines.slice(start, end).join("\n"), startLine: start + 1 };
+}
+
+function anchorLineFor(issue) {
+  if (issue.type === "lint") return issue.detail?.line || 0;
+  if (issue.type === "complexity") return issue.detail?.issueLine || (issue.detail?.functions?.[0]?.line) || 0;
+  if (issue.type === "duplication") return issue.detail?.lineA || 0;
+  return 0;
+}
+
+function splitExplanation(raw) {
+  const text = (raw || "").trim();
+  const suggestionIdx = text.search(/SUGGESTION\s*:/i);
+  if (suggestionIdx === -1) return { explanation: text, suggestion: "" };
+  const explanation = text.slice(0, suggestionIdx).replace(/EXPLANATION\s*:/i, "").trim();
+  const suggestion = text.slice(suggestionIdx).replace(/SUGGESTION\s*:/i, "").trim();
+  return { explanation, suggestion };
 }
 
 // List repositories the user owns or collaborates on (all pages).
@@ -661,6 +741,188 @@ router.post("/:id/ask", async (req, res, next) => {
         { id: String(userMsg._id), role: "user", content: userMsg.content, createdAt: userMsg.createdAt },
         { id: String(assistantMsg._id), role: "assistant", content: answer, sourceFiles, createdAt: assistantMsg.createdAt },
       ],
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// Run deterministic issue detection (no AI) and persist issues for this repo.
+// Delete-then-insert is used so stale issues never linger after re-detection.
+router.post("/:id/detect-issues", async (req, res, next) => {
+  try {
+    if (!mongoose.isValidObjectId(req.params.id)) return res.status(404).json({ error: "Repository not found" });
+    const repoDoc = await Repository.findOne({ _id: req.params.id, ownerUserId: req.user._id });
+    if (!repoDoc) return res.status(404).json({ error: "Repository not found" });
+
+    const hasAnalysis = await FileAnalysis.exists({ repositoryId: repoDoc._id });
+    if (!hasAnalysis) {
+      return res.status(400).json({ error: "No analysis found — run code analysis before detecting issues." });
+    }
+
+    const { issues } = await detectIssues(repoDoc._id);
+
+    await Issue.deleteMany({ repositoryId: repoDoc._id });
+    if (issues.length > 0) {
+      const docs = issues.map((i) => ({
+        repositoryId: repoDoc._id,
+        type: i.type,
+        severity: i.severity,
+        filePath: i.filePath,
+        relatedFilePath: i.relatedFilePath,
+        message: i.message,
+        detail: i.detail,
+        aiExplanation: null,
+        aiSuggestion: null,
+      }));
+      await insertDocsBatch(Issue, docs);
+    }
+
+    const summary = await summarizeIssues(repoDoc._id);
+    res.status(201).json({
+      repositoryId: String(repoDoc._id),
+      message: summary.total === 0 ? "No issues detected." : "Issue detection complete.",
+      ...summary,
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// List issues with optional type/severity filters, paginated, high severity first.
+router.get("/:id/issues", async (req, res, next) => {
+  try {
+    if (!mongoose.isValidObjectId(req.params.id)) return res.status(404).json({ error: "Repository not found" });
+    const repoDoc = await Repository.findOne({ _id: req.params.id, ownerUserId: req.user._id }).lean();
+    if (!repoDoc) return res.status(404).json({ error: "Repository not found" });
+
+    const page = Math.max(parseInt(req.query.page || "1", 10), 1);
+    const limit = Math.min(Math.max(parseInt(req.query.limit || "50", 10), 1), 100);
+    const skip = (page - 1) * limit;
+
+    const match = { repositoryId: repoDoc._id };
+    if (req.query.type) match.type = req.query.type;
+    if (req.query.severity) match.severity = req.query.severity;
+
+    const pagePipeline = [
+      { $match: match },
+      {
+        $addFields: {
+          severityRank: {
+            $switch: {
+              branches: [
+                { case: { $eq: ["$severity", "high"] }, then: 0 },
+                { case: { $eq: ["$severity", "medium"] }, then: 1 },
+              ],
+              default: 2,
+            },
+          },
+        },
+      },
+      { $sort: { severityRank: 1, createdAt: -1 } },
+      {
+        $facet: {
+          data: [{ $skip: skip }, { $limit: limit }],
+          total: [{ $count: "total" }],
+        },
+      },
+    ];
+
+    const [facetResults, summary] = await Promise.all([
+      Issue.aggregate(pagePipeline),
+      summarizeIssues(match.repositoryId),
+    ]);
+    const { data = [], total = [] } = facetResults[0] || {};
+    const totalCount = total[0]?.total || 0;
+
+    res.json({
+      issues: data.map(serializeIssue),
+      total: totalCount,
+      page,
+      limit,
+      filters: { type: req.query.type || null, severity: req.query.severity || null },
+      summary,
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// On-demand AI explanation for a single issue. Cached on the Issue doc and rate
+// limited (same pattern as /ask) to protect free-tier Gemini quota.
+router.post("/:id/issues/:issueId/explain", async (req, res, next) => {
+  try {
+    if (!mongoose.isValidObjectId(req.params.id) || !mongoose.isValidObjectId(req.params.issueId)) {
+      return res.status(404).json({ error: "Issue not found" });
+    }
+    const repoDoc = await Repository.findOne({ _id: req.params.id, ownerUserId: req.user._id });
+    if (!repoDoc) return res.status(404).json({ error: "Repository not found" });
+
+    const issue = await Issue.findOne({ _id: req.params.issueId, repositoryId: repoDoc._id });
+    if (!issue) return res.status(404).json({ error: "Issue not found" });
+
+    // Cache hit — return stored explanation without calling Gemini again.
+    if (issue.aiExplanation) {
+      return res.json({
+        issue: serializeIssue(issue.toObject()),
+        aiExplanation: issue.aiExplanation,
+        aiSuggestion: issue.aiSuggestion,
+        cached: true,
+      });
+    }
+
+    if (!checkExplainRateLimit(req.user._id)) {
+      return res.status(429).json({ error: "Rate limit: max 10 explanations per minute. Please wait." });
+    }
+    if (!process.env.GEMINI_API_KEY) {
+      return res.status(500).json({ error: "GEMINI_API_KEY is not configured on the server." });
+    }
+
+    const primary = await issueExcerpt(repoDoc._id, issue.filePath, anchorLineFor(issue.toObject()));
+    let related = null;
+    if (issue.relatedFilePath) {
+      related = await issueExcerpt(repoDoc._id, issue.relatedFilePath, issue.detail?.lineB || 0);
+    }
+    if (!primary) {
+      // File content unreachable (deleted/not ingested) — nothing to ground an explanation in.
+      const fallback = { explanation: "No file content available for this issue — cannot explain without code context.", suggestion: "" };
+      issue.aiExplanation = fallback.explanation;
+      issue.aiSuggestion = fallback.suggestion;
+      await issue.save();
+      return res.json({
+        issue: serializeIssue(issue.toObject()),
+        aiExplanation: fallback.explanation,
+        aiSuggestion: fallback.suggestion,
+      });
+    }
+
+    let result;
+    try {
+      result = await explainIssue({
+        filePath: primary.path,
+        excerpt: primary.excerpt,
+        relatedFilePath: related?.path || null,
+        relatedExcerpt: related?.excerpt || null,
+        issueType: issue.type,
+        message: issue.message,
+      });
+    } catch (err) {
+      if (/503|UNAVAILABLE|high demand/.test(err.message)) {
+        return res.status(503).json({ error: err.message });
+      }
+      throw err;
+    }
+
+    const { explanation, suggestion } = splitExplanation(result.answer);
+    issue.aiExplanation = explanation;
+    issue.aiSuggestion = suggestion;
+    await issue.save();
+
+    res.json({
+      issue: serializeIssue(issue.toObject()),
+      aiExplanation: explanation,
+      aiSuggestion: suggestion,
+      cached: false,
     });
   } catch (err) {
     next(err);

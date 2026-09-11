@@ -1,5 +1,5 @@
-const PRIMARY_MODEL = process.env.GEMINI_CHAT_MODEL || "gemini-flash-latest";
-const FALLBACK_MODEL = process.env.GEMINI_FALLBACK_MODEL || "gemini-1.5-flash";
+const PRIMARY_MODEL = process.env.GEMINI_CHAT_MODEL || "gemini-flash-lite-latest";
+const FALLBACK_MODEL = process.env.GEMINI_FALLBACK_MODEL || "gemini-3-flash-preview";
 
 function getApiKey() {
   const key = process.env.GEMINI_API_KEY;
@@ -32,11 +32,11 @@ function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
 }
 
-async function tryGenerateWithModel(model, prompt, apiKey, attemptNum, maxAttempts, baseDelay) {
+async function tryGenerateWithModel(model, prompt, apiKey, { temperature = 0.3, maxOutputTokens = 1024 } = {}) {
   const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`;
   const body = {
     contents: [{ role: "user", parts: [{ text: prompt }] }],
-    generationConfig: { temperature: 0.3, maxOutputTokens: 1024 },
+    generationConfig: { temperature, maxOutputTokens },
   };
 
   for (let attempt = 0; attempt < 2; attempt++) {
@@ -51,10 +51,7 @@ async function tryGenerateWithModel(model, prompt, apiKey, attemptNum, maxAttemp
             "Content-Type": "application/json",
             "x-goog-api-key": apiKey,
           },
-          body: JSON.stringify({
-            contents: [{ role: "user", parts: [{ text: prompt }] }],
-            generationConfig: { temperature: 0.3, maxOutputTokens: 1024 },
-          }),
+          body: JSON.stringify(body),
           signal: controller.signal,
         }
       );
@@ -102,11 +99,10 @@ async function tryGenerateWithModel(model, prompt, apiKey, attemptNum, maxAttemp
   throw new Error(`Model ${model} failed after 2 attempts`);
 }
 
-async function generateAnswer(question, relevantChunks) {
+async function generateText(prompt, { temperature = 0.3, maxOutputTokens = 1024 } = {}) {
   const apiKey = getApiKey();
   if (!apiKey) throw new Error("GEMINI_API_KEY is not configured");
 
-  const prompt = buildRagPrompt(question, relevantChunks);
   const models = [PRIMARY_MODEL, FALLBACK_MODEL];
 
   for (let modelIdx = 0; modelIdx < models.length; modelIdx++) {
@@ -116,19 +112,21 @@ async function generateAnswer(question, relevantChunks) {
 
     try {
       console.log(`[ask] trying ${modelLabel} model: ${models[modelIdx]}`);
-      const result = await tryGenerateWithModel(models[modelIdx], buildRagPrompt(question, relevantChunks), apiKey);
+      const result = await tryGenerateWithModel(models[modelIdx], prompt, apiKey, { temperature, maxOutputTokens });
       console.log(`[ask] ${modelLabel} model (${models[modelIdx]}) succeeded`);
       return { answer: result.answer };
     } catch (err) {
       const isLastModel = modelIdx === models.length - 1;
-      const isRetriable = err.message.includes("503") || err.message.includes("429") || err.message.includes("UNAVAILABLE") || err.message.includes("high demand") || err.message.includes("overloaded");
+      const isRetriable =
+        err.name === "AbortError" ||
+        /503|429|UNAVAILABLE|high demand|overloaded|timeout|aborted/i.test(err.message);
 
       if (isLastModel || !isRetriable) {
         console.error(`[ask] All models failed. Last error: ${err.message}`);
-        const err = new Error("The AI service is temporarily busy. Please try again in a moment.");
-        err.status = 503;
-        err.isRetryable = true;
-        throw err;
+        const error = new Error("The AI service is temporarily busy. Please try again in a moment.");
+        error.status = 503;
+        error.isRetryable = true;
+        throw error;
       }
       console.warn(`[ask] ${models[modelIdx]} failed (${err.message}), trying fallback...`);
       await sleep(1000);
@@ -137,8 +135,48 @@ async function generateAnswer(question, relevantChunks) {
   throw new Error("The AI service is temporarily busy. Please try again in a moment.");
 }
 
+async function generateAnswer(question, relevantChunks) {
+  const prompt = buildRagPrompt(question, relevantChunks);
+  return generateText(prompt);
+}
+
+// Issue-explanation path: reuses the exact same model loop, timeout, retry, and
+// fallback behavior as Q&A — just with a purpose-built prompt.
+function buildIssuePrompt(issue) {
+  const blocks = [`Repository file: ${issue.filePath} (issue type: ${issue.issueType})`, "", "Relevant code:", "```"].concat(
+    (issue.excerpt || "").split("\n"),
+    "```"
+  );
+  if (issue.relatedFilePath && issue.relatedExcerpt) {
+    blocks.push("", `Related file: ${issue.relatedFilePath}`, "```");
+    blocks.push(...(issue.relatedExcerpt || "").split("\n"), "```");
+  }
+  blocks.push("", `Detected issue: ${issue.message}`);
+
+  return `You are CodeLens, an AI assistant that helps developers understand code-quality issues in their own codebase.
+
+Explain the detected issue below in plain, actionable language a developer can act on.
+
+Rules:
+- Ground your explanation in the code excerpt provided. Do not invent file contents that are not shown.
+- Be concise: 2-4 sentences for the explanation, then a concrete, specific suggestion.
+- Format your response with EXACTLY two sections, each on a line like this:
+
+EXPLANATION:
+<why this matters and what the impact is>
+
+SUGGESTION:
+<a specific fix the developer can apply>
+
+${blocks.join("\n")}`;
+}
+
+async function explainIssue(issue) {
+  return generateText(buildIssuePrompt(issue), { temperature: 0.2, maxOutputTokens: 1024 });
+}
+
 function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
 }
 
-module.exports = { generateAnswer, buildRagPrompt, PRIMARY_MODEL, FALLBACK_MODEL };
+module.exports = { generateAnswer, generateText, explainIssue, buildRagPrompt, buildIssuePrompt, PRIMARY_MODEL, FALLBACK_MODEL };
