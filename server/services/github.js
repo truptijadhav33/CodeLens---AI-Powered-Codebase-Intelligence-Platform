@@ -89,6 +89,7 @@ async function getRepo(token, owner, repo) {
     size: r.size,
     topics: r.topics || [],
     starCount: r.stargazers_count,
+    avatarUrl: r.owner?.avatar_url || null,
   };
 }
 
