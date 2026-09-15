@@ -6,6 +6,7 @@ import ArchitectureGraph from "../components/ArchitectureGraph";
 import AskTab from "../components/AskTab";
 import IssuesTab from "../components/IssuesTab";
 import DocsTab from "../components/DocsTab";
+import DashboardTab from "../components/DashboardTab";
 
 export default function RepoDetail() {
   const { id } = useParams();
@@ -15,7 +16,7 @@ export default function RepoDetail() {
   const [analysis, setAnalysis] = useState(null);
   const [analyzing, setAnalyzing] = useState(false);
   const [analysisError, setAnalysisError] = useState(null);
-  const [activeTab, setActiveTab] = useState("files");
+  const [activeTab, setActiveTab] = useState("dashboard");
 
   useEffect(() => {
     let cancelled = false;
@@ -78,7 +79,18 @@ export default function RepoDetail() {
   }
 
   if (!repo || files === null) {
-    return <p className="text-sm text-gray-500">Loading repository…</p>;
+    return (
+      <div className="animate-pulse">
+        <div className="h-4 w-32 rounded bg-gray-800" />
+        <div className="mt-4 h-8 w-64 rounded bg-gray-800" />
+        <div className="mt-6 grid grid-cols-2 gap-3 sm:grid-cols-3">
+          {Array.from({ length: 6 }).map((_, i) => (
+            <div key={i} className="h-10 rounded bg-gray-800/60" />
+          ))}
+        </div>
+        <div className="mt-8 h-64 rounded-lg border border-gray-800 bg-gray-900" />
+      </div>
+    );
   }
 
   const meta = [
@@ -128,8 +140,9 @@ export default function RepoDetail() {
         ))}
       </div>
 
-      <div className="mt-8 flex gap-1 border-b border-gray-800">
+      <div className="mt-8 flex gap-1 overflow-x-auto border-b border-gray-800">
         {[
+          ["dashboard", "Dashboard"],
           ["files", "Files"],
           ["analysis", "Code analysis"],
           ["architecture", "Architecture"],
@@ -140,7 +153,7 @@ export default function RepoDetail() {
           <button
             key={key}
             onClick={() => setActiveTab(key)}
-            className={`border-b-2 px-4 py-2 text-sm font-medium transition ${
+            className={`shrink-0 whitespace-nowrap border-b-2 px-4 py-2 text-sm font-medium transition ${
               activeTab === key
                 ? "border-white text-white"
                 : "border-transparent text-gray-500 hover:text-gray-300"
@@ -150,6 +163,12 @@ export default function RepoDetail() {
           </button>
         ))}
       </div>
+
+      {activeTab === "dashboard" && (
+        <div className="mt-4">
+          <DashboardTab repoId={id} onNavigate={setActiveTab} />
+        </div>
+      )}
 
       {activeTab === "files" && (
         <div className="mt-4 overflow-hidden rounded-lg border border-gray-800">

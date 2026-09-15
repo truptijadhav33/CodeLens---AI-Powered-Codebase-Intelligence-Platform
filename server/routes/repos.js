@@ -26,6 +26,8 @@ const { detectIssues } = require("../services/issueDetection");
 const Issue = require("../models/Issue");
 const Documentation = require("../models/Documentation");
 const { SECTION_TYPES, generateSection, docIsFresh } = require("../services/docGenerator");
+const { decryptToken } = require("../services/tokenEncryption");
+const { validateOwnerRepo } = require("../services/repoValidation");
 
 const router = express.Router();
 
@@ -46,6 +48,17 @@ const explainRateStore = new Map();
 const DOCS_RATE_LIMIT = 5;
 const DOCS_WINDOW_MS = 60 * 1000;
 const docsRateStore = new Map();
+
+// Ingest performs large GitHub fetches + storage writes; lookup consumes GitHub
+// API quota. Both are guarded per-user, separately from the Gemini-route limiters
+// because neither calls Gemini.
+const INGEST_RATE_LIMIT = 10;
+const INGEST_WINDOW_MS = 10 * 60 * 1000;
+const ingestRateStore = new Map();
+
+const LOOKUP_RATE_LIMIT = 30;
+const LOOKUP_WINDOW_MS = 60 * 1000;
+const lookupRateStore = new Map();
 
 const SEVERITY_RANK = { high: 0, medium: 1, low: 2 };
 
@@ -69,6 +82,14 @@ function checkExplainRateLimit(userId) {
 
 function checkDocsRateLimit(userId) {
   return checkRateLimit(docsRateStore, userId, DOCS_RATE_LIMIT, DOCS_WINDOW_MS);
+}
+
+function checkIngestRateLimit(userId) {
+  return checkRateLimit(ingestRateStore, userId, INGEST_RATE_LIMIT, INGEST_WINDOW_MS);
+}
+
+function checkLookupRateLimit(userId) {
+  return checkRateLimit(lookupRateStore, userId, LOOKUP_RATE_LIMIT, LOOKUP_WINDOW_MS);
 }
 
 router.use(requireAuth);
@@ -278,7 +299,7 @@ function splitExplanation(raw) {
 // List repositories the user owns or collaborates on (all pages).
 router.get("/", async (req, res, next) => {
   try {
-    const repos = await github.listRepos(req.user.accessToken);
+    const repos = await github.listRepos(decryptToken(req.user.accessToken));
     res.json({ repos });
   } catch (err) {
     next(err);
@@ -291,16 +312,23 @@ router.get("/", async (req, res, next) => {
 router.post("/ingest", async (req, res, next) => {
   const { owner, repo } = req.body || {};
 
-  if (!owner || typeof owner !== "string" || !repo || typeof repo !== "string") {
-    return res.status(400).json({ error: "owner and repo are required in the request body" });
+  const checked = validateOwnerRepo(owner, repo);
+  if (checked.error) {
+    return res.status(400).json({ error: checked.error });
+  }
+
+  if (!checkIngestRateLimit(req.user._id)) {
+    return res.status(429).json({
+      error: "Rate limit: max 10 repository ingests per 10 minutes. Please wait.",
+    });
   }
 
   let repoDoc = null;
 
   try {
-    const token = req.user.accessToken;
-    const meta = await github.getRepo(token, owner, repo);
-    const tree = await github.getFileTree(token, owner, repo, meta.defaultBranch);
+    const token = decryptToken(req.user.accessToken);
+    const meta = await github.getRepo(token, checked.owner, checked.repo);
+    const tree = await github.getFileTree(token, checked.owner, checked.repo, meta.defaultBranch);
 
     const filtered = filterRepoFiles(tree);
 
@@ -386,7 +414,52 @@ router.post("/ingest", async (req, res, next) => {
     }
     if (err.status === 404) {
       return res.status(404).json({
-        error: `Repository '${owner}/${repo}' was not found or is not accessible to your GitHub account.`,
+        error: `Repository '${checked.owner}/${checked.repo}' was not found or is not accessible to your GitHub account.`,
+      });
+    }
+    if (err.status >= 400 && err.status < 500) {
+      return res.status(err.status).json({ error: err.message });
+    }
+    next(err);
+  }
+});
+
+// Preview a repository's public metadata without ingesting anything. Used by the
+// "Analyze any public repository" flow. Registered before GET /:id so "lookup"
+// is not matched as a repository id. Note: GitHub returns 404 for both nonexistent
+// repos and private repos this user cannot see — one honest message covers both.
+router.get("/lookup", async (req, res, next) => {
+  const checked = validateOwnerRepo(req.query.owner, req.query.repo);
+  if (checked.error) {
+    return res.status(400).json({ error: checked.error });
+  }
+
+  if (!checkLookupRateLimit(req.user._id)) {
+    return res.status(429).json({
+      error: "Rate limit: max 30 repository lookups per minute. Please wait.",
+    });
+  }
+
+  try {
+    const token = decryptToken(req.user.accessToken);
+    const meta = await github.getRepo(token, checked.owner, checked.repo);
+    res.json({
+      repo: {
+        owner: meta.owner,
+        name: meta.name,
+        fullName: meta.fullName,
+        description: meta.description,
+        language: meta.language,
+        defaultBranch: meta.defaultBranch,
+        isPrivate: meta.isPrivate,
+        starCount: meta.starCount,
+        avatarUrl: meta.avatarUrl,
+      },
+    });
+  } catch (err) {
+    if (err.status === 404) {
+      return res.status(404).json({
+        error: `Repository '${checked.owner}/${checked.repo}' was not found or is not accessible to your GitHub account.`,
       });
     }
     if (err.status >= 400 && err.status < 500) {
@@ -403,7 +476,29 @@ router.get("/mine", async (req, res, next) => {
       .sort({ ingestedAt: -1 })
       .select({ __v: 0 })
       .lean();
-    res.json({ repos: repos.map((r) => serializeRepo(r)) });
+
+    const repoIds = repos.map((r) => r._id);
+    const healthRows = await Issue.aggregate([
+      { $match: { repositoryId: { $in: repoIds } } },
+      {
+        $group: {
+          _id: "$repositoryId",
+          high: { $sum: { $cond: [{ $eq: ["$severity", "high"] }, 1, 0] } },
+          medium: { $sum: { $cond: [{ $eq: ["$severity", "medium"] }, 1, 0] } },
+          low: { $sum: { $cond: [{ $eq: ["$severity", "low"] }, 1, 0] } },
+          total: { $sum: 1 },
+        },
+      },
+    ]);
+    const healthMap = new Map(healthRows.map((h) => [String(h._id), h]));
+
+    res.json({
+      repos: repos.map((r) => {
+        const repo = serializeRepo(r);
+        repo.health = healthMap.get(String(r._id)) || { high: 0, medium: 0, low: 0, total: 0 };
+        return repo;
+      }),
+    });
   } catch (err) {
     next(err);
   }
@@ -1091,6 +1186,114 @@ router.post("/:id/docs/:sectionType/regenerate", async (req, res, next) => {
 });
 
 // Single ingested repository: metadata + file list (paths/sizes only).
+// Aggregated health/dashboard data for a repository. Query-only: shapes data
+// already computed by earlier phases into a single payload (no recomputation).
+router.get("/:id/dashboard", async (req, res, next) => {
+  try {
+    if (!mongoose.isValidObjectId(req.params.id)) {
+      return res.status(404).json({ error: "Repository not found" });
+    }
+    const repo = await Repository.findOne({ _id: req.params.id, ownerUserId: req.user._id })
+      .select({ __v: 0 })
+      .lean();
+    if (!repo) {
+      return res.status(404).json({ error: "Repository not found" });
+    }
+
+    const repoId = repo._id;
+
+    const [fileStats, issueStats, languageDocs, docs, graph] = await Promise.all([
+      FileAnalysis.aggregate([
+        { $match: { repositoryId: repoId } },
+        {
+          $group: {
+            _id: null,
+            files: { $sum: 1 },
+            avgComplexity: { $avg: "$complexityScore" },
+            totalLines: { $sum: "$linesOfCode" },
+            totalFunctions: { $sum: { $size: "$functions" } },
+            totalLintIssues: { $sum: { $size: "$lintIssues" } },
+          },
+        },
+      ]),
+      Issue.aggregate([
+        { $match: { repositoryId: repoId } },
+        {
+          $group: {
+            _id: null,
+            high: { $sum: { $cond: [{ $eq: ["$severity", "high"] }, 1, 0] } },
+            medium: { $sum: { $cond: [{ $eq: ["$severity", "medium"] }, 1, 0] } },
+            low: { $sum: { $cond: [{ $eq: ["$severity", "low"] }, 1, 0] } },
+            total: { $sum: 1 },
+            lastDetected: { $max: "$createdAt" },
+          },
+        },
+      ]),
+      FileAnalysis.aggregate([
+        { $match: { repositoryId: repoId } },
+        { $group: { _id: "$language", count: { $sum: 1 } } },
+        { $sort: { count: -1 } },
+      ]),
+      Documentation.find({ repositoryId: repoId }).select({ sectionType: 1, generatedAt: 1 }).lean(),
+      buildDependencyGraph(repoId),
+    ]);
+
+    const stats = fileStats[0] || { files: 0, avgComplexity: 0, totalLines: 0, totalFunctions: 0, totalLintIssues: 0 };
+    const issues = issueStats[0] || { high: 0, medium: 0, low: 0, total: 0, lastDetected: null };
+    const sections = docs
+      .map((d) => ({ sectionType: d.sectionType, generatedAt: d.generatedAt }))
+      .sort((a, b) => new Date(a.generatedAt) - new Date(b.generatedAt));
+
+    const topFiles = graph.nodes
+      .filter((n) => n.type === "internal")
+      .sort((a, b) => b.inDegree - a.inDegree)
+      .slice(0, 5)
+      .map((n) => ({ path: n.path, label: n.label, inDegree: n.inDegree }));
+
+    res.json({
+      repository: {
+        id: String(repo._id),
+        fullName: repo.fullName,
+        language: repo.language,
+        status: repo.status,
+        fileCount: repo.fileCount,
+        totalSizeBytes: repo.totalSizeBytes,
+        analysisStatus: repo.analysisStatus || "none",
+        analysisCompletedAt: repo.analysisCompletedAt || null,
+        embeddingStatus: repo.embeddingStatus || "none",
+        embeddingCompletedAt: repo.embeddingCompletedAt || null,
+        embeddingCount: repo.embeddingCount || 0,
+        docsGeneratedAt: sections.length ? sections[sections.length - 1].generatedAt : null,
+      },
+      files: {
+        analyzed: stats.files,
+        averageComplexity: Math.round((stats.avgComplexity || 0) * 100) / 100,
+        totalLinesOfCode: stats.totalLines,
+        totalFunctions: stats.totalFunctions,
+        totalLintIssues: stats.totalLintIssues,
+        languages: languageDocs.map((l) => ({ language: l._id || "other", count: l.count })),
+      },
+      issues: {
+        total: issues.total,
+        bySeverity: { high: issues.high, medium: issues.medium, low: issues.low },
+        lastDetectedAt: issues.lastDetected || null,
+      },
+      dependencies: {
+        topFiles,
+        internalEdges: graph.stats.internalEdges,
+        externalPackages: graph.stats.externalPackages,
+      },
+      documentation: {
+        sections,
+        generated: sections.length,
+        total: SECTION_TYPES.length,
+      },
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
 router.get("/:id", async (req, res, next) => {
   try {
     if (!mongoose.isValidObjectId(req.params.id)) {
