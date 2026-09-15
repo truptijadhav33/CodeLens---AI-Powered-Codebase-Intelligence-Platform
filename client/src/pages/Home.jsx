@@ -6,7 +6,10 @@ export default function Home() {
 
   return (
     <div className="flex flex-col items-center py-24 text-center">
-      <h1 className="text-5xl font-bold tracking-tight">CodeLens</h1>
+      <img src="/codelens-icon.svg" alt="CodeLens logo" className="h-20 w-20" />
+      <h1 className="mt-6 font-display text-5xl font-bold tracking-tight">
+        Code<span className="text-amber-500">Lens</span>
+      </h1>
       <p className="mt-4 max-w-xl text-lg text-gray-400">
         AI-Powered Codebase Intelligence Platform. Connect your GitHub, ingest a
         repository, and get answers about your code.
