@@ -1,12 +1,24 @@
-import { useEffect, useState } from "react";
+import { lazy, Suspense, useEffect, useState } from "react";
 import { Link, useParams } from "react-router-dom";
 import apiFetch from "../lib/api";
 import { formatBytes, formatCount } from "../lib/format";
-import ArchitectureGraph from "../components/ArchitectureGraph";
-import AskTab from "../components/AskTab";
 import IssuesTab from "../components/IssuesTab";
-import DocsTab from "../components/DocsTab";
 import DashboardTab from "../components/DashboardTab";
+
+// Heavy tabs — React Flow, markdown, chat UI — loaded only when opened.
+const ArchitectureGraph = lazy(() => import("../components/ArchitectureGraph"));
+const AskTab = lazy(() => import("../components/AskTab"));
+const DocsTab = lazy(() => import("../components/DocsTab"));
+
+function TabLoading() {
+  return (
+    <div className="mt-4 animate-pulse">
+      <div className="h-8 w-48 rounded bg-gray-800" />
+      <div className="mt-4 h-10 rounded bg-gray-800/60" />
+      <div className="mt-3 h-40 rounded-lg border border-gray-800 bg-gray-900" />
+    </div>
+  );
+}
 
 export default function RepoDetail() {
   const { id } = useParams();
@@ -17,6 +29,7 @@ export default function RepoDetail() {
   const [analyzing, setAnalyzing] = useState(false);
   const [analysisError, setAnalysisError] = useState(null);
   const [activeTab, setActiveTab] = useState("dashboard");
+  const [fileView, setFileView] = useState(null); // { path, content, size, error, loading }
 
   useEffect(() => {
     let cancelled = false;
@@ -61,6 +74,25 @@ export default function RepoDetail() {
       setAnalysisError(err.message);
     } finally {
       setAnalyzing(false);
+    }
+  }
+
+  async function openFile(file) {
+    if (fileView && fileView.path === file.path) {
+      setFileView(null);
+      return;
+    }
+    setFileView({ path: file.path, loading: true, error: null, content: null, size: file.size });
+    try {
+      // Purged files have id === null → fetch by path and re-fetch live from GitHub.
+      const url =
+        file.id != null
+          ? `/api/repos/${id}/files/${file.id}`
+          : `/api/repos/${id}/files/by-path?path=${encodeURIComponent(file.path)}`;
+      const data = await apiFetch(url);
+      setFileView({ path: file.path, loading: false, error: null, content: data.file.content, size: data.file.size });
+    } catch (err) {
+      setFileView({ path: file.path, loading: false, error: err.message, content: null, size: null });
     }
   }
 
@@ -171,25 +203,65 @@ export default function RepoDetail() {
       )}
 
       {activeTab === "files" && (
-        <div className="mt-4 overflow-hidden rounded-lg border border-gray-800">
-          <table className="w-full text-left text-sm">
-            <thead className="bg-gray-900 text-xs uppercase tracking-wide text-gray-500">
-              <tr>
-                <th className="px-4 py-3">Path</th>
-                <th className="px-4 py-3 text-right">Size</th>
-              </tr>
-            </thead>
-            <tbody className="divide-y divide-gray-800 bg-gray-950">
-              {files.map((file) => (
-                <tr key={file.path} className="font-mono hover:bg-gray-900">
-                  <td className="px-4 py-2 text-gray-300">{file.path}</td>
-                  <td className="px-4 py-2 text-right text-gray-500">
-                    {formatBytes(file.size)}
-                  </td>
+        <div className="mt-4">
+          <div className="overflow-hidden rounded-lg border border-gray-800">
+            <table className="w-full text-left text-sm">
+              <thead className="bg-gray-900 text-xs uppercase tracking-wide text-gray-500">
+                <tr>
+                  <th className="px-4 py-3">Path</th>
+                  <th className="px-4 py-3 text-right">Size</th>
                 </tr>
-              ))}
-            </tbody>
-          </table>
+              </thead>
+              <tbody className="divide-y divide-gray-800 bg-gray-950">
+                {files.map((file) => {
+                  const active = fileView && fileView.path === file.path;
+                  return (
+                    <tr
+                      key={file.path}
+                      onClick={() => openFile(file)}
+                      className={`cursor-pointer font-mono hover:bg-gray-900 ${
+                        active ? "bg-gray-900" : ""
+                      }`}
+                    >
+                      <td className="flex items-center gap-2 px-4 py-2 text-gray-300">
+                        {file.path}
+                        {file.purged && (
+                          <span className="shrink-0 rounded bg-teal-900/40 px-1.5 py-0.5 text-[10px] uppercase tracking-wide text-teal-300">
+                            re-fetch
+                          </span>
+                        )}
+                      </td>
+                      <td className="px-4 py-2 text-right text-gray-500">
+                        {formatBytes(file.size)}
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+
+          {fileView && fileView.path === file.path && (
+            <div className="mt-3 rounded-lg border border-gray-800 bg-gray-950">
+              <div className="flex items-center justify-between border-b border-gray-800 px-4 py-2">
+                <span className="font-mono text-xs text-gray-400">{fileView.path}</span>
+                <span className="text-xs text-gray-500">{formatBytes(fileView.size)}</span>
+              </div>
+              {fileView.loading ? (
+                <div className="p-4">
+                  <div className="h-3 w-3/4 animate-pulse rounded bg-gray-800" />
+                  <div className="mt-2 h-3 w-1/2 animate-pulse rounded bg-gray-800" />
+                  <div className="mt-2 h-3 w-2/3 animate-pulse rounded bg-gray-800" />
+                </div>
+              ) : fileView.error ? (
+                <div className="p-4 text-sm text-red-300">{fileView.error}</div>
+              ) : (
+                <pre className="max-h-96 overflow-auto p-4 font-mono text-xs leading-relaxed text-gray-300">
+                  {fileView.content}
+                </pre>
+              )}
+            </div>
+          )}
         </div>
       )}
 
@@ -293,7 +365,9 @@ export default function RepoDetail() {
 
       {activeTab === "architecture" && (
         <div className="mt-4">
-          <ArchitectureGraph repoId={id} />
+          <Suspense fallback={<TabLoading />}>
+            <ArchitectureGraph repoId={id} />
+          </Suspense>
         </div>
       )}
 
@@ -305,13 +379,17 @@ export default function RepoDetail() {
 
       {activeTab === "ask" && (
         <div className="mt-4">
-          <AskTab repoId={id} />
+          <Suspense fallback={<TabLoading />}>
+            <AskTab repoId={id} />
+          </Suspense>
         </div>
       )}
 
       {activeTab === "docs" && (
         <div className="mt-4">
-          <DocsTab repoId={id} repoName={repo.fullName} />
+          <Suspense fallback={<TabLoading />}>
+            <DocsTab repoId={id} repoName={repo.fullName} />
+          </Suspense>
         </div>
       )}
     </div>

@@ -172,14 +172,30 @@ function analysisMessage(summary) {
   return null;
 }
 
-async function analyzeRepository(repoDoc) {
-  const repoFiles = await RepositoryFile.find({ repositoryId: repoDoc._id }).lean();
-  const supportedFiles = repoFiles.filter((f) => getLanguage(f.path));
-  const unsupportedFiles = repoFiles.length - supportedFiles.length;
+async function analyzeRepository(repoDoc, token) {
+  const repoInfos = await repoFileInfos(repoDoc._id);
+  const skippedFiles = [];
 
   const analysisDocs = [];
-  for (const file of supportedFiles) {
-    const parseResult = parseFile(file.content, file.path);
+  let supportedCount = 0;
+  for (const file of repoInfos) {
+    const language = getLanguage(file.path);
+    if (!language) continue;
+    supportedCount += 1;
+
+    let content = file.content;
+    if (content == null) {
+      // Pure raw source (purged after embedding) — re-fetch it before parsing,
+      // since Babel/ESLint need the full file, not chunks.
+      const fetched = await refetchFileContent(token, repoDoc, file.path);
+      if (!fetched.ok) {
+        skippedFiles.push({ path: file.path, reason: SOURCE_REMOVED_REASON });
+        continue;
+      }
+      content = fetched.content;
+    }
+
+    const parseResult = parseFile(content, file.path);
     const base = {
       repositoryId: repoDoc._id,
       path: file.path,
@@ -191,7 +207,7 @@ async function analyzeRepository(repoDoc) {
       continue;
     }
     if (parseResult.parseError) {
-      const lint = await lintContent(file.content, file.path);
+      const lint = await lintContent(content, file.path);
       analysisDocs.push({
         ...base,
         status: "parse_error",
@@ -203,7 +219,7 @@ async function analyzeRepository(repoDoc) {
     }
 
     const complexity = analyzeFile(parseResult);
-    const lint = await lintContent(file.content, file.path);
+    const lint = await lintContent(content, file.path);
     analysisDocs.push({
       ...base,
       status: "analyzed",
@@ -217,11 +233,13 @@ async function analyzeRepository(repoDoc) {
     });
   }
 
+  const unsupportedFiles = repoInfos.length - supportedCount - skippedFiles.length;
+
   // Replace stale results from any previous analysis run.
   await FileAnalysis.deleteMany({ repositoryId: repoDoc._id });
   await insertDocsBatch(FileAnalysis, analysisDocs);
 
-  return { analysisDocs, unsupportedFiles, totalFiles: repoFiles.length };
+  return { analysisDocs, unsupportedFiles, skippedFiles, totalFiles: repoInfos.length };
 }
 
 function insertDocsBatch(Model, docs) {
@@ -294,6 +312,42 @@ function splitExplanation(raw) {
   const explanation = text.slice(0, suggestionIdx).replace(/EXPLANATION\s*:/i, "").trim();
   const suggestion = text.slice(suggestionIdx).replace(/SUGGESTION\s*:/i, "").trim();
   return { explanation, suggestion };
+}
+
+// Message shown whenever a purged file can no longer be re-fetched from GitHub.
+const SOURCE_REMOVED_REASON =
+  "Original source was removed after embedding to save storage, and it's no longer fetchable from GitHub (repo may be private, deleted, or access revoked).";
+
+// Re-fetch a single file's raw content from GitHub by path (contents API).
+// Returns { ok: true, content, size } or { ok: false } without throwing, so
+// callers can fall back gracefully.
+async function refetchFileContent(token, repoDoc, path) {
+  try {
+    const content = await github.getFileContent(token, repoDoc.owner, repoDoc.name, path, repoDoc.defaultBranch);
+    return { ok: true, content, size: Buffer.byteLength(content) };
+  } catch (err) {
+    console.warn(`[refetch] ${repoDoc.fullName} ${path}: ${err.message}`);
+    return { ok: false };
+  }
+}
+
+// The complete set of files a repo knows about: docs still stored in
+// RepositoryFile (with content) plus paths that only survive as Chunk docs after
+// their raw source was purged (content === null, purged === true).
+async function repoFileInfos(repositoryId) {
+  const [files, chunkPaths] = await Promise.all([
+    RepositoryFile.find({ repositoryId })
+      .select({ path: 1, size: 1, content: 1 })
+      .lean(),
+    Chunk.distinct("path", { repositoryId }),
+  ]);
+  const byPath = new Map(files.map((f) => [f.path, f]));
+  for (const p of chunkPaths) {
+    if (!byPath.has(p)) {
+      byPath.set(p, { path: p, size: null, content: null, purged: true });
+    }
+  }
+  return [...byPath.values()];
 }
 
 // List repositories the user owns or collaborates on (all pages).
@@ -514,8 +568,8 @@ router.post("/:id/analyze", async (req, res, next) => {
     if (!repoDoc) {
       return res.status(404).json({ error: "Repository not found" });
     }
-    const existing = await RepositoryFile.countDocuments({ repositoryId: repoDoc._id });
-    if (existing === 0) {
+    const files = await repoFileInfos(repoDoc._id);
+    if (files.length === 0) {
       return res.status(400).json({
         error: "Repository has no ingested files — run ingestion before analysis.",
       });
@@ -526,7 +580,8 @@ router.post("/:id/analyze", async (req, res, next) => {
     await repoDoc.save();
 
     try {
-      const { analysisDocs, unsupportedFiles, totalFiles } = await analyzeRepository(repoDoc);
+      const token = decryptToken(req.user.accessToken);
+      const { analysisDocs, unsupportedFiles, skippedFiles, totalFiles } = await analyzeRepository(repoDoc, token);
 
       repoDoc.analysisStatus = "complete";
       repoDoc.analysisCompletedAt = new Date();
@@ -535,10 +590,16 @@ router.post("/:id/analyze", async (req, res, next) => {
       const summary = buildAnalysisSummary(analysisDocs, totalFiles);
       summary.unsupportedFiles = unsupportedFiles;
       summary.message = analysisMessage(summary);
+      if (skippedFiles.length > 0) {
+        summary.message = summary.message
+          ? `${summary.message} ${skippedFiles.length} file(s) skipped — their source is no longer accessible on GitHub.`
+          : `${skippedFiles.length} file(s) skipped because their source is no longer accessible on GitHub.`;
+      }
       res.status(201).json({
         repository: serializeRepo(repoDoc),
         summary,
         files: analysisDocs.map(serializeAnalysisFile),
+        skipped: skippedFiles,
       });
     } catch (err) {
       repoDoc.analysisStatus = "failed";
@@ -563,7 +624,7 @@ router.get("/:id/analysis", async (req, res, next) => {
     }
     const [analysisDocs, totalFiles] = await Promise.all([
       FileAnalysis.find({ repositoryId: repoDoc._id }).sort({ path: 1 }).lean(),
-      RepositoryFile.countDocuments({ repositoryId: repoDoc._id }),
+      repoFileInfos(repoDoc._id).then((f) => f.length),
     ]);
     const summary = buildAnalysisSummary(analysisDocs, totalFiles);
     summary.message = analysisMessage(summary);
@@ -673,6 +734,16 @@ router.post("/:id/embed", async (req, res, next) => {
       await Chunk.deleteMany({ repositoryId: repoDoc._id });
       await insertDocsBatch(Chunk, finalChunks);
 
+      // Raw source is now redundant with chunk content, so drop it from
+      // RepositoryFile for every path we actually chunked. Non-chunked files
+      // (JSON, configs, unsupported languages) keep their stored source.
+      const chunkedPaths = await Chunk.distinct("path", { repositoryId: repoDoc._id });
+      const purgeResult = await RepositoryFile.deleteMany({
+        repositoryId: repoDoc._id,
+        path: { $in: chunkedPaths },
+      });
+      const filesPurged = purgeResult.deletedCount;
+
       repoDoc.embeddingStatus = "complete";
       repoDoc.embeddingCompletedAt = new Date();
       repoDoc.embeddingCount = finalChunks.length;
@@ -686,6 +757,7 @@ router.post("/:id/embed", async (req, res, next) => {
         chunksSkipped: skipped,
         chunksEmbedded: embedded,
         eligibleFiles: eligibleFiles.length,
+        filesPurged,
       });
     } catch (err) {
       repoDoc.embeddingStatus = "failed";
@@ -1305,11 +1377,77 @@ router.get("/:id", async (req, res, next) => {
     if (!doc) {
       return res.status(404).json({ error: "Repository not found" });
     }
-    const files = await RepositoryFile.find({ repositoryId: doc._id })
-      .select({ content: 0, _id: 1, __v: 0, createdAt: 0, updatedAt: 0 })
-      .sort({ path: 1 })
+    const info = await repoFileInfos(doc._id);
+    const files = info
+      .map((f) => (f.purged ? { id: null, path: f.path, type: "file", size: null, purged: true } : serializeFile(f)))
+      .sort((a, b) => a.path.localeCompare(b.path));
+    res.json({ repository: serializeRepo(doc), files });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// File content by path — the Files tab uses this for entries whose raw source
+// was purged after embedding (id === null, they no longer exist in RepositoryFile).
+// Live-re-fetches from GitHub and re-caches so repeat views don't re-fetch.
+router.get("/:id/files/by-path", async (req, res, next) => {
+  try {
+    if (!mongoose.isValidObjectId(req.params.id)) {
+      return res.status(404).json({ error: "Repository not found" });
+    }
+    const path = String(req.query.path || "").trim();
+    if (!path) {
+      return res.status(400).json({ error: "path query parameter is required" });
+    }
+    const repoDoc = await Repository.findOne({ _id: req.params.id, ownerUserId: req.user._id })
+      .select({ owner: 1, name: 1, fullName: 1, defaultBranch: 1 })
       .lean();
-    res.json({ repository: serializeRepo(doc), files: files.map(serializeFile) });
+    if (!repoDoc) {
+      return res.status(404).json({ error: "Repository not found" });
+    }
+    const file = await RepositoryFile.findOne({ repositoryId: repoDoc._id, path })
+      .select({ __v: 0, updatedAt: 0 })
+      .lean();
+    if (file) {
+      return res.json({
+        file: {
+          id: String(file._id),
+          repositoryId: String(file.repositoryId),
+          path: file.path,
+          type: file.type,
+          size: file.size,
+          content: file.content,
+        },
+      });
+    }
+
+    // Doc missing — source was purged after embedding. Re-fetch live from GitHub.
+    const token = decryptToken(req.user.accessToken);
+    const fetched = await refetchFileContent(token, repoDoc, path);
+    if (!fetched.ok) {
+      return res.status(410).json({ error: SOURCE_REMOVED_REASON });
+    }
+
+    // Re-cache so subsequent views don't re-fetch from GitHub each time.
+    await RepositoryFile.deleteOne({ repositoryId: repoDoc._id, path });
+    await RepositoryFile.create({
+      repositoryId: repoDoc._id,
+      path,
+      type: "file",
+      size: fetched.size,
+      content: fetched.content,
+    });
+
+    res.json({
+      file: {
+        id: null,
+        repositoryId: String(repoDoc._id),
+        path,
+        type: "file",
+        size: fetched.size,
+        content: fetched.content,
+      },
+    });
   } catch (err) {
     next(err);
   }

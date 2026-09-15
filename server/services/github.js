@@ -116,4 +116,23 @@ async function getBlobContent(token, owner, repo, sha) {
   return Buffer.from(data.content, "base64").toString("utf8");
 }
 
-module.exports = { GitHubError, listRepos, getRepo, getFileTree, getBlobContent };
+// Fetch a file's raw content by path (contents API). Used to re-fetch source
+// that was purged from storage after embedding. The contents endpoint caps at
+// 1MB per file, which is above our MAX_FILE_BYTES ingest guard, so any file we
+// ever stored can be re-fetched here too.
+async function getFileContent(token, owner, repo, path, branch) {
+  const encodedPath = path
+    .split("/")
+    .map(encodeURIComponent)
+    .join("/");
+  const ref = branch ? `?ref=${encodeURIComponent(branch)}` : "";
+  const url = `${GITHUB_API}/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/contents/${encodedPath}${ref}`;
+  const res = await ghFetch(token, url);
+  const data = await res.json();
+  if (data.type !== "file" || data.encoding !== "base64") {
+    throw new GitHubError(422, `'${path}' is not a file on GitHub`);
+  }
+  return Buffer.from(data.content, "base64").toString("utf8");
+}
+
+module.exports = { GitHubError, listRepos, getRepo, getFileTree, getBlobContent, getFileContent };
