@@ -1,5 +1,6 @@
 import { Link, NavLink, Outlet } from "react-router-dom";
 import { useAuth } from "../context/AuthContext";
+import { API_URL } from "../lib/config";
 
 const navLinkClass = ({ isActive }) =>
   `rounded-lg px-3 py-2 text-sm font-medium transition ${
@@ -50,7 +51,7 @@ export default function Layout() {
                 </>
               ) : (
                 <a
-                  href={`${import.meta.env.VITE_API_URL || ""}/auth/github`}
+                  href={`${API_URL}/auth/github`}
                   className="rounded-lg border border-gray-700 px-3 py-1.5 text-xs text-gray-300 transition hover:bg-gray-800"
                 >
                   Sign in with GitHub

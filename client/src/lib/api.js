@@ -1,5 +1,9 @@
+import { API_URL } from "./config";
+
 async function apiFetch(path, options = {}) {
-  const res = await fetch(path, {
+  // credentials:"include" always — without it the sameSite cookie (prod) or lax
+  // cookie (dev) never reaches the backend on cross-origin requests.
+  const res = await fetch(`${API_URL}${path}`, {
     credentials: "include",
     headers: { "Content-Type": "application/json" },
     ...options,

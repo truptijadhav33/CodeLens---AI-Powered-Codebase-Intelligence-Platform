@@ -15,20 +15,30 @@ const REDIRECT_URI =
 // authenticated request, which is all CodeLens stores.
 const GITHUB_SCOPE = "repo";
 
+// Production is cross-site (Vercel frontend -> Render backend), which requires
+// sameSite:"none" + secure:true — browsers reject sameSite:"none" without
+// secure. Local dev (localhost over http) keeps lax + false so the cookie isn't
+// dropped. The pair must stay environment-conditional, never blanket.
+const IS_PRODUCTION = process.env.NODE_ENV === "production";
+
 function setTokenCookie(res, token) {
   res.cookie("token", token, {
     httpOnly: true,
-    sameSite: "lax",
-    // httponly JWT cookie: only sent over HTTPS when running in production.
-    // In dev (localhost over http) this must be false or the cookie gets dropped.
-    secure: process.env.NODE_ENV === "production",
+    sameSite: IS_PRODUCTION ? "none" : "lax",
+    secure: IS_PRODUCTION,
     maxAge: 7 * 24 * 60 * 60 * 1000,
     path: "/",
   });
 }
 
+// Match the exact attributes used at set time, or clearing silently no-ops.
 function clearTokenCookie(res) {
-  res.clearCookie("token", { httpOnly: true, sameSite: "lax", path: "/" });
+  res.clearCookie("token", {
+    httpOnly: true,
+    sameSite: IS_PRODUCTION ? "none" : "lax",
+    secure: IS_PRODUCTION,
+    path: "/",
+  });
 }
 
 // Redirects to GitHub's OAuth authorize screen. A random `state` value is set as
