@@ -13,14 +13,13 @@ const REDIRECT_URI =
 // read:user -> profile. repo -> needed in Phase 2 for repository ingestion.
 const GITHUB_SCOPE = "read:user repo";
 
-const isSecure = (req) =>
-  req.secure || req.headers["x-forwarded-proto"] === "https";
-
-function setTokenCookie(res, token, req) {
+function setTokenCookie(res, token) {
   res.cookie("token", token, {
     httpOnly: true,
     sameSite: "lax",
-    secure: isSecure(req),
+    // httponly JWT cookie: only sent over HTTPS when running in production.
+    // In dev (localhost over http) this must be false or the cookie gets dropped.
+    secure: process.env.NODE_ENV === "production",
     maxAge: 7 * 24 * 60 * 60 * 1000,
     path: "/",
   });
@@ -118,7 +117,7 @@ router.get("/github/callback", async (req, res) => {
       { expiresIn: "7d" }
     );
 
-    setTokenCookie(res, token, req);
+    setTokenCookie(res, token);
     res.redirect(CLIENT_ORIGIN);
   } catch (err) {
     console.error("GitHub OAuth error:", err.message);
