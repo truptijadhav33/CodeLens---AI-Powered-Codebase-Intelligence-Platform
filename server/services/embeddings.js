@@ -34,7 +34,12 @@ function getQuotaIds(errMessage) {
   try {
     const body = JSON.parse(errMessage);
     for (const d of body?.error?.details || []) {
+      // quotaId can be a top-level detail key, or nested under each violation
+      // (QuotaFailure => violations[].quotaId). Both carry the same metric.
       if (d?.quotaId) ids.push(d.quotaId);
+      for (const v of d?.violations || []) {
+        if (v?.quotaId) ids.push(v.quotaId);
+      }
     }
   } catch {}
   return ids;
