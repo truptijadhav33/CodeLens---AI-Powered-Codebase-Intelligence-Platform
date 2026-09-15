@@ -10,8 +10,10 @@ const JWT_SECRET = process.env.JWT_SECRET || "dev-secret-change-me";
 const CLIENT_ORIGIN = process.env.CLIENT_ORIGIN || "http://localhost:5173";
 const REDIRECT_URI =
   process.env.GITHUB_REDIRECT_URI || "http://localhost:5000/auth/github/callback";
-// read:user -> profile. repo -> needed in Phase 2 for repository ingestion.
-const GITHUB_SCOPE = "read:user repo";
+// repo -> read access to public + private repos. read:user NOT requested: the
+// /user endpoint returns public fields (login, avatar_url, id) on any
+// authenticated request, which is all CodeLens stores.
+const GITHUB_SCOPE = "repo";
 
 function setTokenCookie(res, token) {
   res.cookie("token", token, {
@@ -104,7 +106,7 @@ router.get("/github/callback", async (req, res) => {
           accessToken: tokenData.access_token,
         },
       },
-      { upsert: true, new: true, setDefaultsOnInsert: true }
+      { upsert: true, returnDocument: "after", setDefaultsOnInsert: true }
     );
 
     const token = jwt.sign(
