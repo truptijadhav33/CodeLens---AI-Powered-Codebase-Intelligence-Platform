@@ -31,6 +31,17 @@ app.use((req, _res, next) => {
 });
 app.use(cookieParser());
 
+// Belt-and-suspenders against CDN caching: since April 2026 Vercel may honor
+// upstream cache-control on external-rewrite responses by default, and /api +
+// /auth return per-user data. Set no-store authoritatively at the origin so
+// correctness never depends on vercel.json staying configured exactly right.
+app.use((req, res, next) => {
+  if (req.path.startsWith("/api/") || req.path.startsWith("/auth/")) {
+    res.setHeader("Cache-Control", "no-store");
+  }
+  next();
+});
+
 app.get("/api/health", (_req, res) => {
   res.json({ status: "ok" });
 });

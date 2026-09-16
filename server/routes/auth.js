@@ -15,16 +15,17 @@ const REDIRECT_URI =
 // authenticated request, which is all CodeLens stores.
 const GITHUB_SCOPE = "repo";
 
-// Production is cross-site (Vercel frontend -> Render backend), which requires
-// sameSite:"none" + secure:true — browsers reject sameSite:"none" without
-// secure. Local dev (localhost over http) keeps lax + false so the cookie isn't
-// dropped. The pair must stay environment-conditional, never blanket.
+// Browsers talk to a single origin: /api and /auth are proxied by Vercel's
+// rewrites to this backend in production, and by the Vite dev proxy locally.
+// Same-origin means sameSite can stay "lax" (broadly compatible, no third-party
+// cookie blocking). secure is still required in production (HTTPS only) but must
+// be false in dev where the cookie is served over http or it gets dropped.
 const IS_PRODUCTION = process.env.NODE_ENV === "production";
 
 function setTokenCookie(res, token) {
   res.cookie("token", token, {
     httpOnly: true,
-    sameSite: IS_PRODUCTION ? "none" : "lax",
+    sameSite: "lax",
     secure: IS_PRODUCTION,
     maxAge: 7 * 24 * 60 * 60 * 1000,
     path: "/",
@@ -35,7 +36,7 @@ function setTokenCookie(res, token) {
 function clearTokenCookie(res) {
   res.clearCookie("token", {
     httpOnly: true,
-    sameSite: IS_PRODUCTION ? "none" : "lax",
+    sameSite: "lax",
     secure: IS_PRODUCTION,
     path: "/",
   });
